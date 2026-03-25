@@ -7,3 +7,7 @@
 
 # Keep .gitignore itself
 !.gitignore
+
+# Explicitly exclude cloned repos
+sglang/
+sglang-private/
