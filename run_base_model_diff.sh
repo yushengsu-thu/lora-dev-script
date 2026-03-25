@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/base_model_diff_results"
 SGLANG_DIR="${SCRIPT_DIR}/sglang"
-SGLANG_TML_DIR="${SCRIPT_DIR}/sglang_tml"
+SGLANG_TML_DIR="${SCRIPT_DIR}/sglang-private"
 
 mkdir -p "${RESULTS_DIR}/sglang" "${RESULTS_DIR}/sglang_tml"
 
