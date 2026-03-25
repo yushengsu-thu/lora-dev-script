@@ -42,11 +42,9 @@ def main():
         tp_size=args.tp,
         attention_backend=args.attention_backend,
         disable_cuda_graph=args.disable_cuda_graph,
+        prefill_attention_backend=args.prefill_attention_backend,
+        decode_attention_backend=args.decode_attention_backend,
     )
-    if args.prefill_attention_backend:
-        engine_kwargs["prefill_attention_backend"] = args.prefill_attention_backend
-    if args.decode_attention_backend:
-        engine_kwargs["decode_attention_backend"] = args.decode_attention_backend
     if args.trust_remote_code:
         engine_kwargs["trust_remote_code"] = True
     if args.disable_shared_experts_fusion:

@@ -98,8 +98,14 @@ run_both() {
     echo "#  ${MODEL_NAME}"
     echo "############################################################"
 
-    run_dump "$SGLANG_DIR"     "sglang"     "$MODEL_NAME" "$MODEL_PATH" "${EXTRA_ARGS[@]}"
-    run_dump "$SGLANG_TML_DIR" "sglang_tml" "$MODEL_NAME" "$MODEL_PATH" "${EXTRA_ARGS[@]}"
+    if ! run_dump "$SGLANG_DIR" "sglang" "$MODEL_NAME" "$MODEL_PATH" "${EXTRA_ARGS[@]}"; then
+        echo "[ERROR] sglang dump failed for ${MODEL_NAME}, skipping."
+        return 1
+    fi
+    if ! run_dump "$SGLANG_TML_DIR" "sglang_tml" "$MODEL_NAME" "$MODEL_PATH" "${EXTRA_ARGS[@]}"; then
+        echo "[ERROR] sglang_tml dump failed for ${MODEL_NAME}, skipping."
+        return 1
+    fi
     compare "$MODEL_NAME"
 }
 
