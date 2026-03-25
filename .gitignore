@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# But not these
+!*.py
+!*.sh
+
+# Keep .gitignore itself
+!.gitignore
