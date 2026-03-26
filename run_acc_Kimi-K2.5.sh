@@ -20,7 +20,7 @@ python "${SCRIPT_DIR}/check_sglang_lora_correctness.py" \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
     --tp 4 \
-    --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --prefill-attention-backend fa4 \
-    --decode-attention-backend flashinfer
+    --decode-attention-backend flashinfer \
+    --disable-cuda-graph
