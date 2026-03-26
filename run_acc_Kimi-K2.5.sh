@@ -19,8 +19,9 @@ python "${SCRIPT_DIR}/check_sglang_lora_correctness.py" \
     --adapter-path "$ADAPTER_PATH" \
     --model-path "$MODEL_PATH" \
     --trust-remote-code \
-    --tp 4 \
+    --tp 8 \
     --experts-shared-outer-loras \
+    --moe-runner-backend triton \
     --prefill-attention-backend fa4 \
     --decode-attention-backend flashinfer \
     --disable-cuda-graph
