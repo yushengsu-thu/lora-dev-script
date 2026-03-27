@@ -11,3 +11,4 @@
 # Explicitly exclude cloned repos
 sglang/
 sglang-private/
+lora_test_cases/
