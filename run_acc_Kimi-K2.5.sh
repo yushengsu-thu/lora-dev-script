@@ -23,5 +23,4 @@ python "${SCRIPT_DIR}/check_sglang_lora_correctness.py" \
     --experts-shared-outer-loras \
     --moe-runner-backend triton \
     --prefill-attention-backend fa4 \
-    --decode-attention-backend flashinfer \
-    --disable-cuda-graph
+    --decode-attention-backend flashinfer
