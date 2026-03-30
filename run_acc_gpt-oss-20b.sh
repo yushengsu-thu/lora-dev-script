@@ -17,7 +17,7 @@ PYTHONPATH="${SCRIPT_DIR}/sglang/python:$PYTHONPATH" \
 python "${SCRIPT_DIR}/check_sglang_lora_correctness.py" \
     --adapter-path "$ADAPTER_PATH" \
     --model-path "$MODEL_PATH" \
-    --tp 8 \
+    --tp 4 \
     --experts-shared-outer-loras \
     --moe-runner-backend triton \
     --prefill-attention-backend fa4 \
