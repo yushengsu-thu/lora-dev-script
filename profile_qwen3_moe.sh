@@ -56,6 +56,9 @@ MEM_FRAC="${MEM_FRAC:-0.8}"
 
 DUMMY="${DUMMY:-0}"
 
+PREFILL_ATTN_BACKEND="${PREFILL_ATTN_BACKEND:-}"
+DECODE_ATTN_BACKEND="${DECODE_ATTN_BACKEND:-}"
+
 # ============================================================
 # Derived settings
 # ============================================================
@@ -80,13 +83,23 @@ if [[ "${MOE_A2A}" != "none" ]]; then
     MOE_FLAGS+=" --moe-a2a-backend ${MOE_A2A}"
 fi
 
+ATTN_FLAGS=""
+if [[ -n "${PREFILL_ATTN_BACKEND}" ]]; then
+    ATTN_FLAGS+=" --prefill-attention-backend ${PREFILL_ATTN_BACKEND}"
+fi
+if [[ -n "${DECODE_ATTN_BACKEND}" ]]; then
+    ATTN_FLAGS+=" --decode-attention-backend ${DECODE_ATTN_BACKEND}"
+fi
+
 LORA_SERVER_FLAGS=""
 LORA_BENCH_FLAGS=""
 if [[ "${LORA}" == "1" ]]; then
-    LORA_SERVER_FLAGS="--enable-lora --lora-paths ${LORA_NAME}=${LORA_PATH} --moe-runner-backend triton --experts-shared-outer-loras --prefill-attention-backend fa4 --decode-attention-backend fa4 --disable-cuda-graph"
+    _LORA_PREFILL="${PREFILL_ATTN_BACKEND:-fa4}"
+    _LORA_DECODE="${DECODE_ATTN_BACKEND:-fa4}"
+    LORA_SERVER_FLAGS="--enable-lora --lora-paths ${LORA_NAME}=${LORA_PATH} --moe-runner-backend triton --experts-shared-outer-loras --prefill-attention-backend ${_LORA_PREFILL} --decode-attention-backend ${_LORA_DECODE} --enable-cudagraph-gc"
     LORA_BENCH_FLAGS="--lora-name ${LORA_NAME}"
     echo "[INFO] LoRA enabled: ${LORA_NAME} -> ${LORA_PATH}"
-    echo "[INFO] LoRA backends: moe-runner=triton, attention=fa4, experts-shared-outer-loras"
+    echo "[INFO] LoRA backends: moe-runner=triton, prefill-attn=${_LORA_PREFILL}, decode-attn=${_LORA_DECODE}, experts-shared-outer-loras"
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -135,6 +148,10 @@ print_config() {
     else
     echo " LoRA:           disabled"
     fi
+    if [[ -n "${PREFILL_ATTN_BACKEND}" || -n "${DECODE_ATTN_BACKEND}" ]]; then
+    echo " Prefill attn:   ${PREFILL_ATTN_BACKEND:-auto}"
+    echo " Decode attn:    ${DECODE_ATTN_BACKEND:-auto}"
+    fi
     echo " Profile dir:    ${PROFILE_DIR}"
     echo " Timestamp:      ${TIMESTAMP}"
     echo "========================================"
@@ -156,6 +173,7 @@ profile_serving() {
         --tp "${TP}" \
         ${EP_FLAG} \
         ${MOE_FLAGS} \
+        ${ATTN_FLAGS} \
         ${LOAD_FMT_FLAG} \
         ${LORA_SERVER_FLAGS} \
         --port "${SERVER_PORT}" \
@@ -331,9 +349,7 @@ profile_nsight_layerwise() {
             ${LORA_SERVER_FLAGS} \
             --port "${SERVER_PORT}" \
             --host 0.0.0.0 \
-            --enable-layerwise-nvtx-marker \
-            --disable-cuda-graph \
-            &
+            --enable-layerwise-nvtx-marker &
     local NSYS_PID=$!
 
     wait_for_server
