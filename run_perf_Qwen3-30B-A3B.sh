@@ -141,7 +141,6 @@ launch_and_wait "Base + LoRA (CG)" \
     --lora-backend triton \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
-    --disable-radix \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
