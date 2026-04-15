@@ -108,24 +108,25 @@ kill_server
 
 # ══════════════════════════════════════════════════════════════
 #  Scenario 2: Base + LoRA (no CG) — LoRA ON, CUDA Graph OFF
+#  [COMMENTED OUT — not needed for this comparison]
 # ══════════════════════════════════════════════════════════════
-launch_and_wait "Base + LoRA (no CG)" \
-    --model "$MODEL_PATH" \
-    --tp "$TP" \
-    --port "$PORT" \
-    --enable-lora \
-    --lora-paths my_lora="$ADAPTER_PATH" \
-    --max-lora-rank 32 \
-    --lora-backend triton \
-    --moe-runner-backend triton \
-    --experts-shared-outer-loras \
-    --disable-radix \
-    --disable-cuda-graph \
-    --prefill-attention-backend fa4 \
-    --decode-attention-backend fa4
-
-run_bench "lora_nocg" "--lora-name my_lora"
-kill_server
+# launch_and_wait "Base + LoRA (no CG)" \
+#     --model "$MODEL_PATH" \
+#     --tp "$TP" \
+#     --port "$PORT" \
+#     --enable-lora \
+#     --lora-paths my_lora="$ADAPTER_PATH" \
+#     --max-lora-rank 32 \
+#     --lora-backend triton \
+#     --moe-runner-backend triton \
+#     --experts-shared-outer-loras \
+#     --disable-radix \
+#     --disable-cuda-graph \
+#     --prefill-attention-backend fa4 \
+#     --decode-attention-backend fa4
+#
+# run_bench "lora_nocg" "--lora-name my_lora"
+# kill_server
 
 # ══════════════════════════════════════════════════════════════
 #  Scenario 3: Base + LoRA (CG) — LoRA ON, CUDA Graph ON
@@ -157,7 +158,7 @@ result_dir = sys.argv[1]
 batch_sizes = [1, 128, 512]
 scenarios = [
     ("base_cg",   "Base (CG)"),
-    ("lora_nocg", "Base + LoRA (no CG)"),
+    # ("lora_nocg", "Base + LoRA (no CG)"),
     ("lora_cg",   "Base + LoRA (CG)"),
 ]
 
