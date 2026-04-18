@@ -246,7 +246,9 @@ def main() -> None:
         print(f"ERROR: no valid scenarios in '{args.scenarios}'", file=sys.stderr)
         sys.exit(2)
 
-    # Load all records up front: all_data[scenario][bs] = record dict or None
+    # Load all records up front: all_data[scenario][bs] = record dict or None.
+    # LoRA-variant info (adapter count, distribution) is encoded in the
+    # result-dir name by run_perf_lora.sh, so filenames stay simple.
     all_data: Dict[str, Dict[int, Optional[dict]]] = {}
     for s in scenarios:
         tag = SCENARIO_TAGS[s][0]

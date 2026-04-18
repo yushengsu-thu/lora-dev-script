@@ -42,5 +42,5 @@ exec "${SCRIPT_DIR}/run_perf_lora.sh" \
     --num-waves    2 \
     --min-samples  32 \
     --common-args  "--trust-remote-code --prefill-attention-backend fa4 --decode-attention-backend flashinfer" \
-    --lora-extra-args " --moe-runner-backend triton --experts-shared-outer-loras" \
+    --lora-extra-args "--moe-runner-backend triton --experts-shared-outer-loras" \
     "$@"

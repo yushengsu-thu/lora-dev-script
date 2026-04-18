@@ -63,7 +63,15 @@ COMMON_ARGS=""
 LORA_EXTRA_ARGS=""
 RESULT_DIR=""
 MODEL_REPO=""
-ADAPTER_REPO=""
+# Adapters: accepts one or many HF repos, space-separated. Server-side names
+# are auto-assigned positionally as lora0, lora1, ... (matching input order),
+# so we don't need to store them — they're derivable from the array index.
+ADAPTER_REPOS=()
+# Multi-LoRA sampling (pass-through to bench_one_batch_server). Only relevant
+# when >1 adapter is supplied; ignored by the bench script for single-adapter
+# runs because there's nothing to sample from.
+LORA_REQUEST_DISTRIBUTION="uniform"
+LORA_ZIPF_ALPHA="1.1"
 MAX_WAIT=900         # server startup timeout; DS-V3 JIT can be slow on a cold cache
 
 # When truthy, skip (scenario, BS) pairs whose result JSONL already exists and
@@ -78,7 +86,12 @@ Usage: $0 --model <hf_repo> [--adapter <hf_repo>] [options]
 
 Required:
   --model <hf_repo>             HuggingFace repo for base model (downloaded to ~/models if missing).
-  --adapter <hf_repo>           HuggingFace repo for LoRA adapter (downloaded as dataset).
+  --adapter "<hf_repo> ..."     One or more HuggingFace repos for LoRA adapters
+                                (each downloaded as a dataset). With multiple
+                                adapters, each prompt in a batch gets one
+                                sampled adapter per --lora-request-distribution.
+                                Server-side names are auto-assigned lora0,
+                                lora1, ... (matches the given order).
                                 Required if 'lora' or 'lora_opt' is in --scenarios.
 
 Workload:
@@ -104,10 +117,29 @@ Pass-through server args:
   --lora-extra-args "<args>"    Extra SGLang server args appended to LoRA scenarios only
                                 (e.g. --disable-shared-experts-fusion for DS-V3).
 
+Multi-LoRA sampling (only meaningful when >1 adapter given):
+  --lora-request-distribution <uniform|distinct|skewed>
+                                How to sample a per-prompt adapter within a
+                                batch (default: $LORA_REQUEST_DISTRIBUTION).
+                                Forwarded to bench_one_batch_server.
+  --lora-zipf-alpha <float>     Zipf exponent for 'skewed' sampling; must be
+                                > 1 (default: $LORA_ZIPF_ALPHA).
+
 Misc:
   --result-dir <path>           Output directory (default: ./perf_results_<model_basename>).
   --max-wait <sec>              Server startup timeout (default: $MAX_WAIT).
   -h, --help                    Show this help.
+
+Result layout:
+  Files are always named base_cg_bs<BS>.jsonl / lora_cg_bs<BS>.jsonl /
+  lora_opt_cg_bs<BS>.jsonl. When --result-dir is NOT given, the default
+  result-dir encodes #adapters + distribution so multi-LoRA variants can
+  coexist side-by-side:
+    no adapters           -> perf_results_<model>
+    1 adapter             -> perf_results_<model>_1lora
+    N>1, uniform|distinct -> perf_results_<model>_<N>lora_<dist>
+    N>1, skewed           -> perf_results_<model>_<N>lora_skewed_zipf<alpha>
+  Passing --result-dir explicitly disables this auto-suffixing.
 
 Env vars:
   REUSE                         If truthy (1/true/yes), skip any (scenario, BS)
@@ -123,7 +155,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)            MODEL_REPO="$2";       shift 2 ;;
-        --adapter)          ADAPTER_REPO="$2";     shift 2 ;;
+        --adapter)          read -ra ADAPTER_REPOS <<< "$2"; shift 2 ;;
         --tp)               TP="$2";               shift 2 ;;
         --port)             PORT="$2";             shift 2 ;;
         --input-len)        INPUT_LEN="$2";        shift 2 ;;
@@ -134,6 +166,8 @@ while [[ $# -gt 0 ]]; do
         --scenarios)        SCENARIOS="$2";        shift 2 ;;
         --common-args)      COMMON_ARGS="$2";      shift 2 ;;
         --lora-extra-args)  LORA_EXTRA_ARGS="$2";  shift 2 ;;
+        --lora-request-distribution) LORA_REQUEST_DISTRIBUTION="$2"; shift 2 ;;
+        --lora-zipf-alpha)  LORA_ZIPF_ALPHA="$2";  shift 2 ;;
         --result-dir)       RESULT_DIR="$2";       shift 2 ;;
         --max-wait)         MAX_WAIT="$2";         shift 2 ;;
         -h|--help)          usage 0 ;;
@@ -153,13 +187,53 @@ for SC in "${SCENARIO_LIST[@]}"; do
         *) echo "ERROR: unknown scenario '$SC' (valid: base lora lora_opt)"; exit 1 ;;
     esac
 done
-if [ "$NEEDS_ADAPTER" = "1" ] && [ -z "$ADAPTER_REPO" ]; then
+if [ "$NEEDS_ADAPTER" = "1" ] && [ "${#ADAPTER_REPOS[@]}" -eq 0 ]; then
     echo "ERROR: --adapter is required when scenarios include 'lora' or 'lora_opt'"
     usage 1
 fi
 
+# Validate multi-LoRA sampling flags early so we fail before the first
+# (expensive) server launch. Mirrors bench_one_batch_server's own checks.
+case "$LORA_REQUEST_DISTRIBUTION" in
+    uniform|distinct|skewed) ;;
+    *) echo "ERROR: --lora-request-distribution must be uniform|distinct|skewed (got '$LORA_REQUEST_DISTRIBUTION')"; exit 1 ;;
+esac
+if [ "$LORA_REQUEST_DISTRIBUTION" != "uniform" ] && [ "${#ADAPTER_REPOS[@]}" -lt 2 ]; then
+    echo "ERROR: --lora-request-distribution=$LORA_REQUEST_DISTRIBUTION requires >=2 adapters via --adapter"
+    exit 1
+fi
+# Bash float comparison via awk.
+if ! awk -v a="$LORA_ZIPF_ALPHA" 'BEGIN{exit !(a>1)}'; then
+    echo "ERROR: --lora-zipf-alpha must be > 1 (got '$LORA_ZIPF_ALPHA')"
+    exit 1
+fi
+
+# ---- LoRA result-dir suffix ----
+# Encode N-adapters + distribution (+ zipf alpha for skewed) in the default
+# result-dir name so multiple multi-LoRA variants can coexist side-by-side
+# (e.g. perf_results_Qwen3_5lora_distinct/ vs ..._5lora_uniform/) without
+# clobbering each other. Files inside the dir keep their simple tag names
+# (base_cg_*, lora_cg_*, lora_opt_cg_*) so summarize_perf.py is unchanged.
+# If --result-dir is given explicitly, the suffix is not applied — the user
+# is in full control of the path.
+# Examples:
+#   no adapters           -> "" (base only)
+#   1 adapter             -> "_1lora"          (distribution is a no-op)
+#   5 adapters, distinct  -> "_5lora_distinct"
+#   3 adapters, skewed    -> "_3lora_skewed_zipf1.1"
+LORA_RESULT_SUFFIX=""
+if [ "$NEEDS_ADAPTER" = "1" ]; then
+    LORA_RESULT_SUFFIX="_${#ADAPTER_REPOS[@]}lora"
+    if [ "${#ADAPTER_REPOS[@]}" -gt 1 ]; then
+        LORA_RESULT_SUFFIX="${LORA_RESULT_SUFFIX}_${LORA_REQUEST_DISTRIBUTION}"
+        if [ "$LORA_REQUEST_DISTRIBUTION" = "skewed" ]; then
+            LORA_RESULT_SUFFIX="${LORA_RESULT_SUFFIX}_zipf${LORA_ZIPF_ALPHA}"
+        fi
+    fi
+fi
+
 MODEL_NAME=$(basename "$MODEL_REPO")
-[ -z "$RESULT_DIR" ] && RESULT_DIR="${SCRIPT_DIR}/perf_results_${MODEL_NAME}"
+[ -z "$RESULT_DIR" ] && RESULT_DIR="${SCRIPT_DIR}/perf_results_${MODEL_NAME}${LORA_RESULT_SUFFIX}"
 mkdir -p "$RESULT_DIR"
 
 # ---- GPU auto-detect ----
@@ -189,9 +263,34 @@ download_if_missing() {
 }
 
 MODEL_PATH=$(download_if_missing "$MODEL_REPO" model)
-ADAPTER_PATH=""
+
+# Resolve every adapter and build the two arg strings reused by both LoRA
+# scenarios. Names are positional (lora0, lora1, ...) so duplicate basenames
+# can't collide and the client --lora-name order mirrors the server's
+# --lora-paths order.
+#   SERVER_LORA_PATHS -> "--lora-paths lora0=/p0 lora1=/p1 ..."
+#   CLIENT_LORA_ARGS  -> "--lora-name lora0 lora1 ... [--lora-request-distribution <d>
+#                         [--lora-zipf-alpha <a>]]"
+SERVER_LORA_PATHS=""
+CLIENT_LORA_ARGS=""
 if [ "$NEEDS_ADAPTER" = "1" ]; then
-    ADAPTER_PATH=$(download_if_missing "$ADAPTER_REPO" dataset)
+    for i in "${!ADAPTER_REPOS[@]}"; do
+        local_path=$(download_if_missing "${ADAPTER_REPOS[$i]}" dataset)
+        SERVER_LORA_PATHS="${SERVER_LORA_PATHS} lora${i}=${local_path}"
+        CLIENT_LORA_ARGS="${CLIENT_LORA_ARGS} lora${i}"
+    done
+    SERVER_LORA_PATHS="--lora-paths${SERVER_LORA_PATHS}"
+    CLIENT_LORA_ARGS="--lora-name${CLIENT_LORA_ARGS}"
+
+    # Sampling flags only matter with >1 adapter (bench_one_batch_server
+    # treats a single adapter as broadcast-to-all), so skip them otherwise
+    # to keep the command line tidy.
+    if [ "${#ADAPTER_REPOS[@]}" -gt 1 ]; then
+        CLIENT_LORA_ARGS="${CLIENT_LORA_ARGS} --lora-request-distribution ${LORA_REQUEST_DISTRIBUTION}"
+        if [ "$LORA_REQUEST_DISTRIBUTION" = "skewed" ]; then
+            CLIENT_LORA_ARGS="${CLIENT_LORA_ARGS} --lora-zipf-alpha ${LORA_ZIPF_ALPHA}"
+        fi
+    fi
 fi
 
 # ---- server lifecycle ----
@@ -259,7 +358,10 @@ run_one_bench() {
     local TOTAL=$(( NUM_WAVES * BS ))
     [ "$TOTAL" -lt "$MIN_SAMPLES" ] && TOTAL="$MIN_SAMPLES"
     local OUT_FILE="${RESULT_DIR}/${TAG}_bs${BS}.jsonl"
-    rm -f "$OUT_FILE"
+    # bench_one_batch_server opens the result file in append mode, and
+    # summarize_perf.py always reads the last non-empty line. Keep previous
+    # records so reruns don't destroy data; the freshest run wins in the
+    # summary, and older lines stay available for ad-hoc inspection.
     echo "  >> [${TAG}] BS=${BS}  waves=${NUM_WAVES}  total_prompts=${TOTAL}  (max-running-requests=${BS})"
     # shellcheck disable=SC2086
     PYTHONPATH="${SCRIPT_DIR}/sglang/python:${PYTHONPATH}" \
@@ -303,10 +405,10 @@ run_scenario_lora() {
             --port "$PORT" \
             --max-running-requests "$BS" \
             --enable-lora \
-            --lora-paths "my_lora=${ADAPTER_PATH}" \
+            ${SERVER_LORA_PATHS} \
             --lora-backend triton \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}
-        run_one_bench "lora_cg" "$BS" "--lora-name my_lora"
+        run_one_bench "lora_cg" "$BS" "${CLIENT_LORA_ARGS}"
         kill_server
     done
 }
@@ -321,12 +423,12 @@ run_scenario_lora_opt() {
             --port "$PORT" \
             --max-running-requests "$BS" \
             --enable-lora \
-            --lora-paths "my_lora=${ADAPTER_PATH}" \
+            ${SERVER_LORA_PATHS} \
             --lora-backend triton \
             --lora-use-virtual-experts \
             --enable-cudagraph-gc \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}
-        run_one_bench "lora_opt_cg" "$BS" "--lora-name my_lora"
+        run_one_bench "lora_opt_cg" "$BS" "${CLIENT_LORA_ARGS}"
         kill_server
     done
 }
@@ -335,7 +437,16 @@ run_scenario_lora_opt() {
 echo "================================================================"
 echo "  SGLang LoRA Perf Benchmark (bench_one_batch_server)"
 echo "  Model:        $MODEL_REPO  ($MODEL_PATH)"
-echo "  Adapter:      ${ADAPTER_REPO:-<none>}  ${ADAPTER_PATH:+($ADAPTER_PATH)}"
+if [ "${#ADAPTER_REPOS[@]}" -eq 0 ]; then
+    echo "  Adapters:     <none>"
+else
+    for i in "${!ADAPTER_REPOS[@]}"; do
+        echo "  Adapter[$i]:   lora${i} <- ${ADAPTER_REPOS[$i]}"
+    done
+    if [ "${#ADAPTER_REPOS[@]}" -gt 1 ]; then
+        echo "  Multi-LoRA:   distribution=${LORA_REQUEST_DISTRIBUTION}$([ "$LORA_REQUEST_DISTRIBUTION" = "skewed" ] && echo "  zipf_alpha=${LORA_ZIPF_ALPHA}")"
+    fi
+fi
 echo "  GPU:          ${GPU_NAME} x${GPU_COUNT}"
 echo "  TP:           $TP"
 echo "  Input/Output: ${INPUT_LEN} / ${OUTPUT_LEN}"
@@ -345,6 +456,7 @@ echo "  Scenarios:    ${SCENARIOS}"
 echo "  Common args:  ${COMMON_ARGS:-<none>}"
 echo "  LoRA-extra:   ${LORA_EXTRA_ARGS:-<none>}"
 echo "  Result dir:   $RESULT_DIR"
+echo "  LoRA tag:     ${LORA_RESULT_SUFFIX:-<none>}   (encoded in default result-dir name)"
 echo "  Reuse cache:  REUSE=${REUSE}"
 echo "================================================================"
 
