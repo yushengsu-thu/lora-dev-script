@@ -1,9 +1,10 @@
 #!/bin/bash
 #
-# Profiling script for Qwen3-30B-A3B-Instruct-2507 on SGLang
+# Optimized profiling script for Qwen3-30B-A3B-Instruct-2507 on SGLang
+# (with --lora-use-virtual-experts)
 #
 # Usage:
-#   ./profile_qwen3_moe.sh [MODE]
+#   ./profile_qwen3_moe_optimize.sh [MODE]
 #
 # Modes:
 #   serving        - Profile with bench_serving (realistic online scenario)
@@ -14,8 +15,8 @@
 #   all            - Run one_batch, offline, and serving sequentially
 #
 # LoRA profiling (set LORA=1 to enable):
-#   LORA=1 ./profile_qwen3_moe.sh serving
-#   LORA=1 ./profile_qwen3_moe.sh nsight_layer
+#   LORA=1 ./profile_qwen3_moe_optimize.sh serving
+#   LORA=1 ./profile_qwen3_moe_optimize.sh nsight_layer
 
 set -euo pipefail
 
@@ -96,10 +97,10 @@ LORA_BENCH_FLAGS=""
 if [[ "${LORA}" == "1" ]]; then
     _LORA_PREFILL="${PREFILL_ATTN_BACKEND:-fa4}"
     _LORA_DECODE="${DECODE_ATTN_BACKEND:-fa4}"
-    LORA_SERVER_FLAGS="--enable-lora --lora-paths ${LORA_NAME}=${LORA_PATH} --moe-runner-backend triton --experts-shared-outer-loras --prefill-attention-backend ${_LORA_PREFILL} --decode-attention-backend ${_LORA_DECODE}"
+    LORA_SERVER_FLAGS="--enable-lora --lora-paths ${LORA_NAME}=${LORA_PATH} --moe-runner-backend triton --experts-shared-outer-loras --lora-use-virtual-experts --prefill-attention-backend ${_LORA_PREFILL} --decode-attention-backend ${_LORA_DECODE}"
     LORA_BENCH_FLAGS="--lora-name ${LORA_NAME}"
     echo "[INFO] LoRA enabled: ${LORA_NAME} -> ${LORA_PATH}"
-    echo "[INFO] LoRA backends: moe-runner=triton, prefill-attn=${_LORA_PREFILL}, decode-attn=${_LORA_DECODE}, experts-shared-outer-loras"
+    echo "[INFO] LoRA backends: moe-runner=triton, prefill-attn=${_LORA_PREFILL}, decode-attn=${_LORA_DECODE}, experts-shared-outer-loras, lora-use-virtual-experts"
 fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -135,7 +136,7 @@ kill_server() {
 
 print_config() {
     echo "========================================"
-    echo " Qwen3-30B-A3B MoE Profiling"
+    echo " Qwen3-30B-A3B MoE Profiling (optimize)"
     echo "========================================"
     echo " Model:          ${MODEL_PATH}"
     echo " TP:             ${TP}"
@@ -145,6 +146,7 @@ print_config() {
     echo " Dummy weights:  ${DUMMY}"
     if [[ "${LORA}" == "1" ]]; then
     echo " LoRA:           ${LORA_NAME} -> ${LORA_PATH}"
+    echo " Virtual experts: enabled"
     else
     echo " LoRA:           disabled"
     fi
