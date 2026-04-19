@@ -133,6 +133,7 @@ kill_server
 #  Scenario 3: Base + LoRA (CG) — LoRA ON, CUDA Graph ON
 #  + virtual experts, shared outer loras, cudagraph GC
 # ══════════════════════════════════════════════════════════════
+    # --lora-backend triton \
 launch_and_wait "Base + LoRA (CG, virtual experts)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
@@ -144,7 +145,6 @@ launch_and_wait "Base + LoRA (CG, virtual experts)" \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --lora-use-virtual-experts \
-    --enable-cudagraph-gc \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
