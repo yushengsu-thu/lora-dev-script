@@ -23,17 +23,20 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Auto-pick TP from GPU type (count alone is ambiguous — a box may have
-# 8 GB300 or 4 H200):
-#   * GB300 -> tp=4  (uses 4 of however many GB300s are present)
-#   * H200  -> tp=8  (requires all 8 H200s)
+# Auto-pick TP from GPU type. Count alone is ambiguous (a box may have
+# 8 GB300 or 4 H200), and per-GPU HBM differs too (288/192/141 GB), so
+# minimum TP is driven by how many GPUs it takes to hold the ~671 GB FP8
+# weights plus KV/activations:
+#   * GB300 (288 GB) -> tp=4   (4×288=1152 GB)
+#   * GB200 (192 GB) -> tp=8   (4×192=768 GB is too tight for ~671 GB model)
+#   * H200  (141 GB) -> tp=8   (8×141=1128 GB)
 GPU_LIST=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
 GPU_NAME=$(printf '%s\n' "$GPU_LIST" | awk 'NR==1' | tr -s ' ')
 GPU_COUNT=$(printf '%s\n' "$GPU_LIST" | grep -c . | tr -d ' ')
 case "$GPU_NAME" in
-    *GB300*) TP=4 ;;
-    *H200*)  TP=8 ;;
-    *) echo "ERROR: bench_DeepSeek-V3.1-Base expects GB300 or H200; detected '${GPU_NAME}'"; exit 1 ;;
+    *GB300*)         TP=4 ;;
+    *GB200*|*H200*)  TP=8 ;;
+    *) echo "ERROR: bench_DeepSeek-V3.1-Base expects GB300, GB200, or H200; detected '${GPU_NAME}'"; exit 1 ;;
 esac
 if [ "$GPU_COUNT" -lt "$TP" ]; then
     echo "ERROR: '${GPU_NAME}' run wants tp=${TP} but only ${GPU_COUNT} GPUs are available"
