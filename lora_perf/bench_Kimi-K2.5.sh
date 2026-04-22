@@ -30,12 +30,31 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export SGLANG_DISABLE_CUDNN_CHECK=1
+# Auto-pick TP from GPU type (count alone is ambiguous — a box may have
+# 8 GB300 or 4 H200):
+#   * GB300 -> tp=4  (uses 4 of however many GB300s are present)
+#   * H200  -> tp=8  (requires all 8 H200s)
+GPU_LIST=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+GPU_NAME=$(printf '%s\n' "$GPU_LIST" | awk 'NR==1' | tr -s ' ')
+GPU_COUNT=$(printf '%s\n' "$GPU_LIST" | grep -c . | tr -d ' ')
+case "$GPU_NAME" in
+    *GB300*) TP=4 ;;
+    *H200*)  TP=8 ;;
+    *) echo "ERROR: bench_Kimi-K2.5 expects GB300 or H200; detected '${GPU_NAME}'"; exit 1 ;;
+esac
+if [ "$GPU_COUNT" -lt "$TP" ]; then
+    echo "ERROR: '${GPU_NAME}' run wants tp=${TP} but only ${GPU_COUNT} GPUs are available"
+    exit 1
+fi
 
+# Meaningful EP values on this TP: {1, tp}. SGLang's default moe_dp_size=1
+# enforces ep_size * moe_dp_size == tp_size when ep > 1, so only ep=1 and
+# ep=tp launch cleanly; the sweep covers both.
 exec "${SCRIPT_DIR}/run_perf_lora.sh" \
     --model        moonshotai/Kimi-K2.5 \
     --adapter      yushengsu/lora-diff-Kimi-K2.5 \
-    --tp           8 \
+    --tp           "$TP" \
+    --ep           "1 $TP" \
     --input-len    1024 \
     --output-len   2048 \
     --batch-sizes  "1 128 512" \

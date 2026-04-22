@@ -30,6 +30,7 @@ exec "${SCRIPT_DIR}/run_perf_lora.sh" \
     --model        Qwen/Qwen3-30B-A3B-Instruct-2507 \
     --adapter      yushengsu/lora-diff-Qwen3-30B-A3B-Instruct-2507 \
     --tp           4 \
+    --ep           "1 4" \
     --input-len    1024 \
     --output-len   2048 \
     --batch-sizes  "1 128 512" \

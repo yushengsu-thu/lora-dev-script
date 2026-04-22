@@ -1,10 +1,16 @@
 #!/bin/bash
 # Generic LoRA perf benchmark for SGLang.
 #
-# Runs up to three scenarios against the same model, in one shot:
+# Runs up to three scenarios per (tp, ep, batch-size) combo:
 #   - base:     Base model, CUDA Graph on
 #   - lora:     Base + LoRA, CUDA Graph on
 #   - lora_opt: Base + LoRA, CUDA Graph on, virtual experts + cudagraph-gc
+# (CUDA Graph is on for every scenario, so the filename no longer tags it.)
+#
+# --tp and --ep each accept a single value or a space-separated list. The
+# full cartesian product runs back-to-back; each combo writes to its own
+# subfolder under a shared outer result dir. When >1 combo runs, a combined
+# sweep summary is written at the outer dir.
 #
 # Uses `sglang.bench_one_batch_server` as the client: each BS is measured with
 # a single HTTP POST carrying (NUM_WAVES * BS) prompts, while the server is
@@ -16,26 +22,27 @@
 #
 # Downloads the model and LoRA adapter from HuggingFace into ~/models if not
 # already present (LoRA adapters are pulled as dataset repos via
-# --repo-type dataset).
+# --repo-type dataset). Absolute local paths (starting with "/") are used
+# as-is — no download, no copy.
 #
-# After all runs complete, invokes summarize_perf.py to produce pretty /
-# markdown / tsv tables.
+# Note: --ep 1 is SGLang's own default (ep_size=1, i.e. no expert parallelism).
+# Pass --ep 1 when you want EP disabled — there is no "none" sentinel. For
+# non-MoE models, EP is ignored anyway.
 #
-# Example:
+# Example (single combo):
 #   ./run_perf_lora.sh \
 #       --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
 #       --adapter my-org/my-lora-qwen3-30b \
-#       --batch-sizes "1 128 512" \
-#       --common-args "--prefill-attention-backend fa4 --decode-attention-backend fa4"
+#       --tp 4 --ep 4 \
+#       --batch-sizes "1 128 512"
 #
-#   # DeepSeek V3.1 (MLA + FP8):
+# Example (sweep):
 #   ./run_perf_lora.sh \
 #       --model deepseek-ai/DeepSeek-V3.1-Base \
 #       --adapter org/my-lora-ds \
-#       --tp 8 \
-#       --batch-sizes "1 128 512" \
-#       --common-args "--prefill-attention-backend fa4 --decode-attention-backend flashinfer --moe-runner-backend triton --disable-piecewise-cuda-graph" \
-#       --lora-extra-args "--disable-shared-experts-fusion"
+#       --tp "4 8" --ep "1 8" \
+#       --batch-sizes "1 128"
+#   # -> 4 combos: (tp=4,ep=1), (tp=4,ep=8), (tp=8,ep=1), (tp=8,ep=8)
 
 # ---- stale-process cleanup (before set -e so failures are tolerated) ----
 pkill -9 sglang  2>/dev/null || true
@@ -51,7 +58,11 @@ export SCRIPT_DIR
 export PYTHONPATH="${PYTHONPATH:-}"
 
 # ---- defaults ----
-TP=4
+TPS=(4)
+# Expert-parallel sizes. --ep 1 matches SGLang's default (ep_size=1, i.e.
+# no expert parallelism); pass --ep 1 explicitly to disable EP. Ignored by
+# non-MoE models.
+EPS=(1)
 PORT=30000
 INPUT_LEN=1024
 OUTPUT_LEN=2048
@@ -61,7 +72,7 @@ MIN_SAMPLES=32
 SCENARIOS="base lora lora_opt"
 COMMON_ARGS=""
 LORA_EXTRA_ARGS=""
-RESULT_DIR=""
+OUTER_DIR=""
 MODEL_REPO=""
 # Adapters: accepts one or many HF repos, space-separated. Server-side names
 # are auto-assigned positionally as lora0, lora1, ... (matching input order),
@@ -76,8 +87,6 @@ MAX_WAIT=900         # server startup timeout; DS-V3 JIT can be slow on a cold c
 
 # When truthy, skip (scenario, BS) pairs whose result JSONL already exists and
 # is non-empty. Useful when iterating on one scenario without re-running all.
-# Override ad-hoc per invocation, e.g.:
-#   REUSE=1 ./run_perf_lora.sh --model ... --scenarios "lora_opt"
 REUSE="${REUSE:-false}"
 
 usage() {
@@ -87,66 +96,67 @@ Usage: $0 --model <hf_repo> [--adapter <hf_repo>] [options]
 Required:
   --model <hf_repo>             HuggingFace repo for base model (downloaded to ~/models if missing).
   --adapter "<hf_repo> ..."     One or more HuggingFace repos for LoRA adapters
-                                (each downloaded as a dataset). With multiple
-                                adapters, each prompt in a batch gets one
-                                sampled adapter per --lora-request-distribution.
-                                Server-side names are auto-assigned lora0,
-                                lora1, ... (matches the given order).
+                                (each downloaded as a dataset). Server-side
+                                names are auto-assigned lora0, lora1, ...
                                 Required if 'lora' or 'lora_opt' is in --scenarios.
 
-Workload:
-  --tp <int>                    Tensor parallel size (default: $TP).
+Workload (each supports one value or a space-separated list; full product runs):
+  --tp "<a> [b ...]"            Tensor parallel sizes (default: ${TPS[*]}).
+  --ep "<a> [b ...]"            Expert parallel sizes (default: ${EPS[*]}).
+                                Use --ep 1 to disable EP (SGLang's default).
+                                Ignored by non-MoE models.
+  --batch-sizes "<a> [b ...]"   Batch sizes to sweep (default: "${BATCH_SIZES[*]}").
+                                Server is relaunched per BS with --max-running-requests=BS.
+
   --port <int>                  Server port (default: $PORT).
   --input-len <int>             Prompt length in tokens (default: $INPUT_LEN).
   --output-len <int>            Generated length in tokens (default: $OUTPUT_LEN).
-  --batch-sizes "<a> <b> ..."   Space-separated batch sizes to sweep (default: "${BATCH_SIZES[*]}").
-                                Server is relaunched per BS with --max-running-requests=BS.
   --num-waves <int>             Full-batch waves per measurement (default: $NUM_WAVES).
                                 Each measurement sends total_prompts prompts in one request;
                                 max-running-requests=BS serializes them into ~num_waves waves.
   --min-samples <int>           Floor on total_prompts per measurement (default: $MIN_SAMPLES).
                                 total_prompts = max(min_samples, num_waves * BS).
-                                Keeps BS=1 runs long enough for stable throughput.
 
 Scenarios:
   --scenarios "<list>"          Subset of: base lora lora_opt (default: all three).
 
 Pass-through server args:
-  --common-args "<args>"        Extra SGLang server args appended to ALL scenarios
-                                (e.g. attention/MoE backends).
-  --lora-extra-args "<args>"    Extra SGLang server args appended to LoRA scenarios only
-                                (e.g. --disable-shared-experts-fusion for DS-V3).
+  --common-args "<args>"        Extra SGLang server args for ALL scenarios.
+  --lora-extra-args "<args>"    Extra SGLang server args for LoRA scenarios only.
 
 Multi-LoRA sampling (only meaningful when >1 adapter given):
-  --lora-request-distribution <uniform|distinct|skewed>
-                                How to sample a per-prompt adapter within a
-                                batch (default: $LORA_REQUEST_DISTRIBUTION).
-                                Forwarded to bench_one_batch_server.
-  --lora-zipf-alpha <float>     Zipf exponent for 'skewed' sampling; must be
-                                > 1 (default: $LORA_ZIPF_ALPHA).
+  --lora-request-distribution <uniform|distinct|skewed>   (default: $LORA_REQUEST_DISTRIBUTION)
+  --lora-zipf-alpha <float>     Zipf exponent for 'skewed'; > 1 (default: $LORA_ZIPF_ALPHA).
 
 Misc:
-  --result-dir <path>           Output directory (default: ./perf_results_<model_basename>).
+  --result-dir <path>           Override the OUTER result dir. Inner tp/ep
+                                subdirs and file names are unaffected.
   --max-wait <sec>              Server startup timeout (default: $MAX_WAIT).
   -h, --help                    Show this help.
 
 Result layout:
-  Files are always named base_cg_bs<BS>.jsonl / lora_cg_bs<BS>.jsonl /
-  lora_opt_cg_bs<BS>.jsonl. When --result-dir is NOT given, the default
-  result-dir encodes #adapters + distribution so multi-LoRA variants can
-  coexist side-by-side:
-    no adapters           -> perf_results_<model>
-    1 adapter             -> perf_results_<model>_1lora
-    N>1, uniform|distinct -> perf_results_<model>_<N>lora_<dist>
-    N>1, skewed           -> perf_results_<model>_<N>lora_skewed_zipf<alpha>
-  Passing --result-dir explicitly disables this auto-suffixing.
+    <outer_dir>/
+        tp<TP>_ep<EP>/
+            base_bs<BS>.jsonl
+            lora_bs<BS>.jsonl
+            lora_opt_bs<BS>.jsonl
+            summary.md
+            summary.tsv
+        ...                                (one subdir per combo)
+        combined_summary.md                (only when >1 combo)
+        combined_summary.tsv
+
+  Default <outer_dir> is:
+    perf_results_<model>[_<loratag>]
+
+  Where _<loratag> is:
+      1 adapter             -> _1lora
+      N>1, uniform|distinct -> _<N>lora_<dist>
+      N>1, skewed           -> _<N>lora_skewed_zipf<alpha>
 
 Env vars:
-  REUSE                         If truthy (1/true/yes), skip any (scenario, BS)
-                                whose <tag>_bs<BS>.jsonl already exists and is
-                                non-empty. Server launch is skipped too.
-                                Example:
-                                  REUSE=1 $0 --model ... --scenarios "lora_opt"
+  REUSE                         Truthy (1/true/yes) skips any (scenario, BS)
+                                whose result file already exists and is non-empty.
 EOF
     exit "${1:-0}"
 }
@@ -156,7 +166,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)            MODEL_REPO="$2";       shift 2 ;;
         --adapter)          read -ra ADAPTER_REPOS <<< "$2"; shift 2 ;;
-        --tp)               TP="$2";               shift 2 ;;
+        --tp)               read -ra TPS <<< "$2"; shift 2 ;;
+        --ep)               read -ra EPS <<< "$2"; shift 2 ;;
         --port)             PORT="$2";             shift 2 ;;
         --input-len)        INPUT_LEN="$2";        shift 2 ;;
         --output-len)       OUTPUT_LEN="$2";       shift 2 ;;
@@ -168,7 +179,7 @@ while [[ $# -gt 0 ]]; do
         --lora-extra-args)  LORA_EXTRA_ARGS="$2";  shift 2 ;;
         --lora-request-distribution) LORA_REQUEST_DISTRIBUTION="$2"; shift 2 ;;
         --lora-zipf-alpha)  LORA_ZIPF_ALPHA="$2";  shift 2 ;;
-        --result-dir)       RESULT_DIR="$2";       shift 2 ;;
+        --result-dir)       OUTER_DIR="$2";        shift 2 ;;
         --max-wait)         MAX_WAIT="$2";         shift 2 ;;
         -h|--help)          usage 0 ;;
         *) echo "Unknown arg: $1"; usage 1 ;;
@@ -176,6 +187,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [ -z "$MODEL_REPO" ] && { echo "ERROR: --model is required"; usage 1; }
+[ "${#TPS[@]}" -eq 0 ] && { echo "ERROR: --tp resolved to an empty list"; exit 1; }
+[ "${#EPS[@]}" -eq 0 ] && { echo "ERROR: --ep resolved to an empty list"; exit 1; }
 
 # Parse scenarios once, validate, and decide whether adapter is needed.
 IFS=' ' read -ra SCENARIO_LIST <<< "$SCENARIOS"
@@ -209,18 +222,8 @@ if ! awk -v a="$LORA_ZIPF_ALPHA" 'BEGIN{exit !(a>1)}'; then
 fi
 
 # ---- LoRA result-dir suffix ----
-# Encode N-adapters + distribution (+ zipf alpha for skewed) in the default
-# result-dir name so multiple multi-LoRA variants can coexist side-by-side
-# (e.g. perf_results_Qwen3_5lora_distinct/ vs ..._5lora_uniform/) without
-# clobbering each other. Files inside the dir keep their simple tag names
-# (base_cg_*, lora_cg_*, lora_opt_cg_*) so summarize_perf.py is unchanged.
-# If --result-dir is given explicitly, the suffix is not applied — the user
-# is in full control of the path.
-# Examples:
-#   no adapters           -> "" (base only)
-#   1 adapter             -> "_1lora"          (distribution is a no-op)
-#   5 adapters, distinct  -> "_5lora_distinct"
-#   3 adapters, skewed    -> "_3lora_skewed_zipf1.1"
+# Encode #adapters + distribution (+ zipf alpha for skewed) into the outer
+# dir name so LoRA variants coexist side-by-side.
 LORA_RESULT_SUFFIX=""
 if [ "$NEEDS_ADAPTER" = "1" ]; then
     LORA_RESULT_SUFFIX="_${#ADAPTER_REPOS[@]}lora"
@@ -233,22 +236,84 @@ if [ "$NEEDS_ADAPTER" = "1" ]; then
 fi
 
 MODEL_NAME=$(basename "$MODEL_REPO")
-[ -z "$RESULT_DIR" ] && RESULT_DIR="${SCRIPT_DIR}/perf_results_${MODEL_NAME}${LORA_RESULT_SUFFIX}"
-mkdir -p "$RESULT_DIR"
+[ -z "$OUTER_DIR" ] && OUTER_DIR="${SCRIPT_DIR}/perf_results_${MODEL_NAME}${LORA_RESULT_SUFFIX}"
+mkdir -p "$OUTER_DIR"
+
+# ---- tee stdout/stderr to a per-run log so failures are post-mortem-able ----
+# Timestamped so reruns coexist. Placed after OUTER_DIR creation so the log
+# lives with the per-run results. Early arg-parse failures still surface to
+# the terminal normally.
+LOG_FILE="${OUTER_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Log: $LOG_FILE"
 
 # ---- GPU auto-detect ----
 if command -v nvidia-smi >/dev/null 2>&1; then
-    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr -s ' ')
-    GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')
+    # Query once to avoid `nvidia-smi | head -1` SIGPIPE under `set -o pipefail`
+    # (head closes the pipe, nvidia-smi gets SIGPIPE -> exit 141 -> script aborts).
+    GPU_LIST=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true)
+    GPU_NAME=$(printf '%s\n' "$GPU_LIST" | awk 'NR==1' | tr -s ' ')
+    GPU_COUNT=$(printf '%s\n' "$GPU_LIST" | grep -c . | tr -d ' ')
 else
     GPU_NAME="unknown"
     GPU_COUNT=0
 fi
 
+# ---- filter (tp, ep) combos to legal ones ----
+# Users can throw any mix of tp/ep values at the script; we drop (with a
+# warning) the combos SGLang would reject at launch. Rules enforced:
+#   * tp <= #gpus                        (TP shards weights across GPUs)
+#   * ep <= tp                           (ep_size * moe_dp_size <= tp_size)
+#   * ep == 1  OR  ep == tp              (moe_dp_size defaults to 1; when
+#                                         ep > 1, SGLang asserts
+#                                         ep_size * moe_dp_size == tp_size)
+# The third rule can be relaxed by also setting moe_dp_size>1 via
+# --common-args, but we don't auto-detect that — users who need such configs
+# should run those combos explicitly.
+VALID_TPS=()
+VALID_EPS=()
+SKIPPED_COUNT=0
+for _tp in "${TPS[@]}"; do
+    for _ep in "${EPS[@]}"; do
+        _reason=""
+        if [ "$GPU_COUNT" -gt 0 ] && [ "$_tp" -gt "$GPU_COUNT" ]; then
+            _reason="tp=${_tp} > available GPUs (${GPU_COUNT})"
+        elif [ "$_ep" -gt "$_tp" ]; then
+            _reason="ep=${_ep} > tp=${_tp}; SGLang requires ep_size * moe_dp_size <= tp_size"
+        elif [ "$_ep" -ne 1 ] && [ "$_ep" -ne "$_tp" ]; then
+            _reason="ep=${_ep} is neither 1 nor tp=${_tp}; with default moe_dp_size=1, SGLang requires ep ∈ {1, tp}"
+        fi
+        if [ -n "$_reason" ]; then
+            echo "WARN: skipping combo tp=${_tp} ep=${_ep} — ${_reason}"
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        else
+            VALID_TPS+=("$_tp")
+            VALID_EPS+=("$_ep")
+        fi
+    done
+done
+unset _tp _ep _reason
+NUM_COMBOS=${#VALID_TPS[@]}
+if [ "$NUM_COMBOS" -eq 0 ]; then
+    echo "ERROR: no legal (tp, ep) combos to run (all ${SKIPPED_COUNT} requested combos were filtered out)"
+    exit 1
+fi
+
 # ---- model/adapter download ----
 download_if_missing() {
-    # $1 = hf repo, $2 = "model"|"dataset"
+    # $1 = hf repo or absolute local path, $2 = "model"|"dataset"
     local REPO="$1" TYPE="$2"
+    # Absolute local path: use it as-is (no download, no copy). Error out
+    # if it doesn't exist rather than letting `hf download` try to resolve
+    # a path as an HF repo id.
+    if [[ "$REPO" == /* ]]; then
+        if [ -d "$REPO" ]; then
+            echo "$REPO"
+            return
+        fi
+        echo "ERROR: local path '$REPO' does not exist" >&2
+        exit 1
+    fi
     local LOCAL_PATH="$HOME/models/$(basename "$REPO")"
     if [ -d "$LOCAL_PATH" ] && [ -n "$(ls -A "$LOCAL_PATH" 2>/dev/null || true)" ]; then
         echo "$LOCAL_PATH"
@@ -268,9 +333,6 @@ MODEL_PATH=$(download_if_missing "$MODEL_REPO" model)
 # scenarios. Names are positional (lora0, lora1, ...) so duplicate basenames
 # can't collide and the client --lora-name order mirrors the server's
 # --lora-paths order.
-#   SERVER_LORA_PATHS -> "--lora-paths lora0=/p0 lora1=/p1 ..."
-#   CLIENT_LORA_ARGS  -> "--lora-name lora0 lora1 ... [--lora-request-distribution <d>
-#                         [--lora-zipf-alpha <a>]]"
 SERVER_LORA_PATHS=""
 CLIENT_LORA_ARGS=""
 if [ "$NEEDS_ADAPTER" = "1" ]; then
@@ -282,9 +344,6 @@ if [ "$NEEDS_ADAPTER" = "1" ]; then
     SERVER_LORA_PATHS="--lora-paths${SERVER_LORA_PATHS}"
     CLIENT_LORA_ARGS="--lora-name${CLIENT_LORA_ARGS}"
 
-    # Sampling flags only matter with >1 adapter (bench_one_batch_server
-    # treats a single adapter as broadcast-to-all), so skip them otherwise
-    # to keep the command line tidy.
     if [ "${#ADAPTER_REPOS[@]}" -gt 1 ]; then
         CLIENT_LORA_ARGS="${CLIENT_LORA_ARGS} --lora-request-distribution ${LORA_REQUEST_DISTRIBUTION}"
         if [ "$LORA_REQUEST_DISTRIBUTION" = "skewed" ]; then
@@ -332,11 +391,9 @@ kill_server() {
 }
 
 # Clean up on abnormal exit
-trap 'echo ""; echo "Caught exit; cleaning up..."; kill_server 2>/dev/null || true' EXIT
+trap 'echo ""; echo "Caught exit; cleaning up..."; echo "Log: $LOG_FILE"; kill_server 2>/dev/null || true' EXIT
 
 # ---- reuse-existing-results gate ----
-# Returns 0 (skip) when REUSE is truthy AND the target result file already
-# exists and is non-empty; 1 (run) otherwise.
 should_skip_bench() {
     local TAG="$1" BS="$2"
     local OUT_FILE="${RESULT_DIR}/${TAG}_bs${BS}.jsonl"
@@ -353,15 +410,11 @@ should_skip_bench() {
 
 # ---- single measurement (one BS, one scenario) ----
 run_one_bench() {
-    # $1 = tag (e.g. "base_cg"), $2 = BS, $3 = LoRA client args string
+    # $1 = tag (e.g. "base"), $2 = BS, $3 = LoRA client args string
     local TAG="$1" BS="$2" LORA_FLAG="$3"
     local TOTAL=$(( NUM_WAVES * BS ))
     [ "$TOTAL" -lt "$MIN_SAMPLES" ] && TOTAL="$MIN_SAMPLES"
     local OUT_FILE="${RESULT_DIR}/${TAG}_bs${BS}.jsonl"
-    # bench_one_batch_server opens the result file in append mode, and
-    # summarize_perf.py always reads the last non-empty line. Keep previous
-    # records so reruns don't destroy data; the freshest run wins in the
-    # summary, and older lines stay available for ad-hoc inspection.
     echo "  >> [${TAG}] BS=${BS}  waves=${NUM_WAVES}  total_prompts=${TOTAL}  (max-running-requests=${BS})"
     # shellcheck disable=SC2086
     PYTHONPATH="${SCRIPT_DIR}/sglang/python:${PYTHONPATH}" \
@@ -379,47 +432,50 @@ run_one_bench() {
         ${LORA_FLAG}
 }
 
-# ---- scenario runners (relaunch server per BS) ----
+# ---- scenario runners (relaunch server per BS; read $TP/$EP_ARG/$RESULT_DIR set by combo loop) ----
 run_scenario_base() {
     for BS in "${BATCH_SIZES[@]}"; do
-        if should_skip_bench "base_cg" "$BS"; then continue; fi
+        if should_skip_bench "base" "$BS"; then continue; fi
         # shellcheck disable=SC2086
-        launch_and_wait "Base (CG) BS=${BS}" \
+        launch_and_wait "Base TP=${TP} EP=${EP} BS=${BS}" \
             --model "$MODEL_PATH" \
             --tp "$TP" \
+            ${EP_ARG} \
             --port "$PORT" \
             --max-running-requests "$BS" \
             ${COMMON_ARGS}
-        run_one_bench "base_cg" "$BS" ""
+        run_one_bench "base" "$BS" ""
         kill_server
     done
 }
 
 run_scenario_lora() {
     for BS in "${BATCH_SIZES[@]}"; do
-        if should_skip_bench "lora_cg" "$BS"; then continue; fi
+        if should_skip_bench "lora" "$BS"; then continue; fi
         # shellcheck disable=SC2086
-        launch_and_wait "Base + LoRA (CG) BS=${BS}" \
+        launch_and_wait "Base + LoRA TP=${TP} EP=${EP} BS=${BS}" \
             --model "$MODEL_PATH" \
             --tp "$TP" \
+            ${EP_ARG} \
             --port "$PORT" \
             --max-running-requests "$BS" \
             --enable-lora \
             ${SERVER_LORA_PATHS} \
             --lora-backend triton \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}
-        run_one_bench "lora_cg" "$BS" "${CLIENT_LORA_ARGS}"
+        run_one_bench "lora" "$BS" "${CLIENT_LORA_ARGS}"
         kill_server
     done
 }
 
 run_scenario_lora_opt() {
     for BS in "${BATCH_SIZES[@]}"; do
-        if should_skip_bench "lora_opt_cg" "$BS"; then continue; fi
+        if should_skip_bench "lora_opt" "$BS"; then continue; fi
         # shellcheck disable=SC2086
-        launch_and_wait "Base + LoRA (CG, optimized) BS=${BS}" \
+        launch_and_wait "Base + LoRA (optimized) TP=${TP} EP=${EP} BS=${BS}" \
             --model "$MODEL_PATH" \
             --tp "$TP" \
+            ${EP_ARG} \
             --port "$PORT" \
             --max-running-requests "$BS" \
             --enable-lora \
@@ -428,7 +484,7 @@ run_scenario_lora_opt() {
             --lora-use-virtual-experts \
             --enable-cudagraph-gc \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}
-        run_one_bench "lora_opt_cg" "$BS" "${CLIENT_LORA_ARGS}"
+        run_one_bench "lora_opt" "$BS" "${CLIENT_LORA_ARGS}"
         kill_server
     done
 }
@@ -448,43 +504,89 @@ else
     fi
 fi
 echo "  GPU:          ${GPU_NAME} x${GPU_COUNT}"
-echo "  TP:           $TP"
-echo "  Input/Output: ${INPUT_LEN} / ${OUTPUT_LEN}"
+echo "  TP sweep:     ${TPS[*]}"
+echo "  EP sweep:     ${EPS[*]}"
 echo "  BatchSizes:   ${BATCH_SIZES[*]}"
+echo "  Combos:       ${NUM_COMBOS} valid / $(( ${#TPS[@]} * ${#EPS[@]} )) requested (${SKIPPED_COUNT} skipped)"
+echo "  Planned runs (tp, ep):"
+for ((i = 0; i < NUM_COMBOS; i++)); do
+    echo "                tp=${VALID_TPS[$i]}  ep=${VALID_EPS[$i]}"
+done
+echo "  Input/Output: ${INPUT_LEN} / ${OUTPUT_LEN}"
 echo "  Prompts/meas: total_prompts = max(${MIN_SAMPLES}, ${NUM_WAVES} * BS)"
 echo "  Scenarios:    ${SCENARIOS}"
 echo "  Common args:  ${COMMON_ARGS:-<none>}"
 echo "  LoRA-extra:   ${LORA_EXTRA_ARGS:-<none>}"
-echo "  Result dir:   $RESULT_DIR"
-echo "  LoRA tag:     ${LORA_RESULT_SUFFIX:-<none>}   (encoded in default result-dir name)"
+echo "  Outer dir:    $OUTER_DIR"
+echo "  Log file:     $LOG_FILE"
 echo "  Reuse cache:  REUSE=${REUSE}"
 echo "================================================================"
 
-# ---- dispatch scenarios ----
-for SC in "${SCENARIO_LIST[@]}"; do
-    case "$SC" in
-        base)     run_scenario_base ;;
-        lora)     run_scenario_lora ;;
-        lora_opt) run_scenario_lora_opt ;;
-    esac
+# ---- dispatch: run each (TP, EP) combo ----
+RESULT_DIRS=()
+COMBO_ARGS=()
+
+for ((i = 0; i < NUM_COMBOS; i++)); do
+    TP="${VALID_TPS[$i]}"
+    EP="${VALID_EPS[$i]}"
+    EP_ARG="--ep $EP"
+    RESULT_DIR="${OUTER_DIR}/tp${TP}_ep${EP}"
+    mkdir -p "$RESULT_DIR"
+
+    echo ""
+    echo "################################################################"
+    echo "  Combo: TP=${TP}  EP=${EP}  BS=${BATCH_SIZES[*]}"
+    echo "  Result dir: $RESULT_DIR"
+    echo "################################################################"
+
+    for SC in "${SCENARIO_LIST[@]}"; do
+        case "$SC" in
+            base)     run_scenario_base ;;
+            lora)     run_scenario_lora ;;
+            lora_opt) run_scenario_lora_opt ;;
+        esac
+    done
+
+    echo ""
+    echo "Per-combo summary (TP=${TP} EP=${EP}):"
+    python3 "${SCRIPT_DIR}/summarize_perf.py" \
+        --result-dir "$RESULT_DIR" \
+        --batch-sizes "${BATCH_SIZES[*]}" \
+        --scenarios  "$SCENARIOS" \
+        --gpu        "$GPU_NAME" \
+        --tp         "$TP" \
+        --ep         "$EP" \
+        --input-len  "$INPUT_LEN" \
+        --output-len "$OUTPUT_LEN"
+
+    RESULT_DIRS+=("$RESULT_DIR")
+    COMBO_ARGS+=(--combo "tp=${TP},ep=${EP},dir=${RESULT_DIR}")
 done
 
 # Disable the EXIT trap before the summary step; servers are already killed.
 trap - EXIT
 
-# ---- summary ----
-echo ""
-echo "Generating summary tables..."
-python3 "${SCRIPT_DIR}/summarize_perf.py" \
-    --result-dir "$RESULT_DIR" \
-    --batch-sizes "${BATCH_SIZES[*]}" \
-    --scenarios  "$SCENARIOS" \
-    --gpu        "$GPU_NAME" \
-    --tp         "$TP" \
-    --input-len  "$INPUT_LEN" \
-    --output-len "$OUTPUT_LEN"
+# ---- combined sweep summary (only when >1 combo) ----
+if [ "$NUM_COMBOS" -gt 1 ]; then
+    echo ""
+    echo "Generating combined sweep summary across ${NUM_COMBOS} combos..."
+    python3 "${SCRIPT_DIR}/summarize_perf.py" \
+        --combine \
+        "${COMBO_ARGS[@]}" \
+        --batch-sizes "${BATCH_SIZES[*]}" \
+        --scenarios  "$SCENARIOS" \
+        --gpu        "$GPU_NAME" \
+        --input-len  "$INPUT_LEN" \
+        --output-len "$OUTPUT_LEN" \
+        --out-dir    "$OUTER_DIR"
+    echo ""
+    echo "Combined summary:"
+    echo "  Markdown: ${OUTER_DIR}/combined_summary.md"
+    echo "  TSV:      ${OUTER_DIR}/combined_summary.tsv"
+fi
 
 echo ""
-echo "Done. Raw JSONL: ${RESULT_DIR}/*.jsonl"
-echo "     Markdown:   ${RESULT_DIR}/summary.md   (paste into Google Docs)"
-echo "     TSV:        ${RESULT_DIR}/summary.tsv  (paste into Google Sheets)"
+echo "Done. Per-combo result dirs:"
+for D in "${RESULT_DIRS[@]}"; do
+    echo "  $D"
+done
