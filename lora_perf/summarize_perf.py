@@ -40,10 +40,11 @@ from tabulate import tabulate
 
 
 SCENARIO_TAGS: Dict[str, Tuple[str, str]] = {
-    # logical_name: (file_tag,       pretty_label)
-    "base":     ("base_cg",     "Base (CG)"),
-    "lora":     ("lora_cg",     "LoRA (CG)"),
-    "lora_opt": ("lora_opt_cg", "LoRA optimized (CG)"),
+    # logical_name: (file_tag,   pretty_label)
+    # CUDA Graph is on for every scenario, so the file tag no longer marks it.
+    "base":     ("base",     "Base"),
+    "lora":     ("lora",     "LoRA"),
+    "lora_opt": ("lora_opt", "LoRA optimized"),
 }
 
 
@@ -149,10 +150,11 @@ def load_last_record(path: str) -> Optional[dict]:
 
 def build_run_info(args, scenarios: List[str], batch_sizes: List[int]) -> Table:
     t = Table("Run Info")
-    t.headers = ["GPU", "TP", "input_len", "output_len", "batch_sizes", "scenarios"]
+    t.headers = ["GPU", "TP", "EP", "input_len", "output_len", "batch_sizes", "scenarios"]
     t.add(
         args.gpu,
         args.tp,
+        args.ep,
         args.input_len,
         args.output_len,
         ",".join(map(str, batch_sizes)),
@@ -218,13 +220,15 @@ def build_comparison_table(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--result-dir",  required=True)
+    p.add_argument("--result-dir",  default=None,
+                   help="Per-combo dir (required unless --combine is set).")
     p.add_argument("--batch-sizes", required=True,
                    help='Space-separated, e.g. "1 128 512"')
     p.add_argument("--scenarios",   default="base lora lora_opt",
                    help='Subset of: base lora lora_opt')
     p.add_argument("--gpu",         default="?")
     p.add_argument("--tp",          default="?")
+    p.add_argument("--ep",          default="?")
     p.add_argument("--input-len",   default="?")
     p.add_argument("--output-len",  default="?")
     p.add_argument("--format",      default="pretty",
@@ -234,11 +238,120 @@ def parse_args() -> argparse.Namespace:
                    help="Path to write markdown summary (default: <result-dir>/summary.md)")
     p.add_argument("--tsv-file",    default=None,
                    help="Path to write TSV summary (default: <result-dir>/summary.tsv)")
-    return p.parse_args()
+    # ---- combined sweep mode ----
+    p.add_argument("--combine", action="store_true",
+                   help="Aggregate multiple per-combo dirs into one sweep summary.")
+    p.add_argument("--combo",   action="append", default=[],
+                   help="With --combine: repeatable 'tp=<n>,ep=<n>,dir=<path>'.")
+    p.add_argument("--out-dir", default=None,
+                   help="With --combine: where to write combined_summary.{md,tsv}.")
+    args = p.parse_args()
+    if args.combine:
+        if not args.combo:
+            p.error("--combine requires at least one --combo spec")
+    else:
+        if not args.result_dir:
+            p.error("--result-dir is required unless --combine is set")
+    return args
+
+
+def parse_combo_spec(spec: str) -> Dict[str, str]:
+    """'tp=4,ep=1,dir=/path' -> {'tp': '4', 'ep': '1', 'dir': '/path'}."""
+    out: Dict[str, str] = {}
+    for part in spec.split(","):
+        if "=" not in part:
+            raise ValueError(f"--combo spec missing '=' in part {part!r} (full: {spec!r})")
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    missing = {"tp", "ep", "dir"} - out.keys()
+    if missing:
+        raise ValueError(f"--combo spec missing keys {sorted(missing)} in {spec!r}")
+    return out
+
+
+def build_sweep_table(
+    combos: List[Dict[str, str]],
+    scenarios: List[str],
+    batch_sizes: List[int],
+) -> Table:
+    """Flat table: one row per (combo, BS). Shows overall_throughput for
+    each scenario plus per-scenario ratios vs base when 'base' is in play."""
+    t = Table("Sweep: overall_throughput (tokens/s) by (TP, EP, BS) & scenario")
+    scenario_labels = [SCENARIO_TAGS[s][1] for s in scenarios]
+    ratio_scs = [s for s in scenarios if s != "base"] if "base" in scenarios else []
+    t.headers = (
+        ["TP", "EP", "BS"]
+        + scenario_labels
+        + [f"{SCENARIO_TAGS[s][1]}/base" for s in ratio_scs]
+    )
+    t.floatfmt = (
+        ["d", "d", "d"]
+        + [".1f"] * len(scenarios)
+        + [""] * len(ratio_scs)
+    )
+
+    for combo in combos:
+        tp_i, ep_i = int(combo["tp"]), int(combo["ep"])
+        for bs in batch_sizes:
+            vals: Dict[str, Optional[float]] = {}
+            for s in scenarios:
+                tag = SCENARIO_TAGS[s][0]
+                rec = load_last_record(os.path.join(combo["dir"], f"{tag}_bs{bs}.jsonl"))
+                vals[s] = rec.get("overall_throughput") if rec else None
+            row: List[Any] = [tp_i, ep_i, bs] + [vals[s] for s in scenarios]
+            base_v = vals.get("base")
+            for s in ratio_scs:
+                v = vals[s]
+                if v is not None and base_v not in (None, 0):
+                    row.append(f"{v / base_v * 100:.1f}%")
+                else:
+                    row.append("N/A")
+            t.add(*row)
+    return t
+
+
+def run_combine(args: argparse.Namespace) -> None:
+    combos = [parse_combo_spec(c) for c in args.combo]
+    batch_sizes = [int(x) for x in args.batch_sizes.split()]
+    scenarios = [s for s in args.scenarios.split() if s in SCENARIO_TAGS]
+    if not scenarios:
+        print(f"ERROR: no valid scenarios in '{args.scenarios}'", file=sys.stderr)
+        sys.exit(2)
+
+    out_dir = args.out_dir or os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+
+    info = Table("Sweep Run Info")
+    info.headers = ["GPU", "input_len", "output_len", "batch_sizes", "scenarios", "combos"]
+    info.add(
+        args.gpu,
+        args.input_len,
+        args.output_len,
+        ",".join(map(str, batch_sizes)),
+        " ".join(scenarios),
+        len(combos),
+    )
+    tables = [info, build_sweep_table(combos, scenarios, batch_sizes)]
+
+    render = {"pretty": Table.pretty, "markdown": Table.markdown, "tsv": Table.tsv}[args.format]
+    print("\n\n".join(render(t) for t in tables))
+
+    md_path = os.path.join(out_dir, "combined_summary.md")
+    tsv_path = os.path.join(out_dir, "combined_summary.tsv")
+    with open(md_path, "w") as f:
+        f.write("\n\n".join(t.markdown() for t in tables) + "\n")
+    with open(tsv_path, "w") as f:
+        f.write("\n\n".join(t.tsv() for t in tables) + "\n")
+
+    print(f"\nMarkdown summary: {md_path}", file=sys.stderr)
+    print(f"TSV      summary: {tsv_path}", file=sys.stderr)
 
 
 def main() -> None:
     args = parse_args()
+    if args.combine:
+        run_combine(args)
+        return
 
     batch_sizes = [int(x) for x in args.batch_sizes.split()]
     scenarios = [s for s in args.scenarios.split() if s in SCENARIO_TAGS]
