@@ -117,7 +117,7 @@ kill_server
 #     --enable-lora \
 #     --lora-paths my_lora="$ADAPTER_PATH" \
 #     --max-lora-rank 32 \
-#     --lora-backend triton \
+#     --lora-backend csgmv \
 #     --moe-runner-backend triton \
 #     --experts-shared-outer-loras \
 #     --disable-radix \
@@ -138,7 +138,7 @@ launch_and_wait "Base + LoRA (CG)" \
     --enable-lora \
     --lora-paths my_lora="$ADAPTER_PATH" \
     --max-lora-rank 32 \
-    --lora-backend triton \
+    --lora-backend csgmv \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --prefill-attention-backend fa4 \

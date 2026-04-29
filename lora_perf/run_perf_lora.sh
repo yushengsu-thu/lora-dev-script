@@ -461,7 +461,7 @@ run_scenario_lora() {
             --max-running-requests "$BS" \
             --enable-lora \
             ${SERVER_LORA_PATHS} \
-            --lora-backend triton \
+            --lora-backend csgmv \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}
         run_one_bench "lora" "$BS" "${CLIENT_LORA_ARGS}"
         kill_server
@@ -480,7 +480,7 @@ run_scenario_lora_opt() {
             --max-running-requests "$BS" \
             --enable-lora \
             ${SERVER_LORA_PATHS} \
-            --lora-backend triton \
+            --lora-backend csgmv \
             --lora-use-virtual-experts \
             --enable-cudagraph-gc \
             ${COMMON_ARGS} ${LORA_EXTRA_ARGS}

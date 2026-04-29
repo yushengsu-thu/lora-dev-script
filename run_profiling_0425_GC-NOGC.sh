@@ -186,7 +186,7 @@ run_profile_lora_cg() {
         --enable-lora \
         --lora-paths my_lora="$ADAPTER_PATH" \
         --max-lora-rank 32 \
-        --lora-backend triton \
+        --lora-backend csgmv \
         --moe-runner-backend triton \
         --experts-shared-outer-loras \
         --lora-use-virtual-experts \
@@ -239,7 +239,7 @@ run_profile_lora_no_cg() {
         --enable-lora \
         --lora-paths my_lora="$ADAPTER_PATH" \
         --max-lora-rank 32 \
-        --lora-backend triton \
+        --lora-backend csgmv \
         --moe-runner-backend triton \
         --experts-shared-outer-loras \
         --lora-use-virtual-experts \

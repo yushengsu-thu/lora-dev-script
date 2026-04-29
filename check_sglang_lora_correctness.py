@@ -96,6 +96,17 @@ def parse_args():
         action="store_true",
         help="Optimize the model with torch.compile",
     )
+    parser.add_argument(
+        "--lora-use-virtual-experts",
+        action="store_true",
+        help="Enable virtual expert computation for MoE LoRA",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        type=str,
+        default=None,
+        help="LoRA backend (triton, csgmv). Overrides the hardcoded default.",
+    )
     return parser.parse_args()
 
 def main():
@@ -108,13 +119,14 @@ def main():
         enable_lora=True,
         max_lora_rank=32,
         lora_paths={"my_lora": args.adapter_path},
-        # lora_backend="triton",
-        lora_backend="csgmv",
+        lora_backend=args.lora_backend or "csgmv",
         attention_backend=args.attention_backend,
         disable_cuda_graph=args.disable_cuda_graph,
         prefill_attention_backend=args.prefill_attention_backend,
         decode_attention_backend=args.decode_attention_backend,
     )
+    if args.lora_use_virtual_experts:
+        engine_kwargs["lora_use_virtual_experts"] = True
     if args.lora_target_modules is not None:
         engine_kwargs["lora_target_modules"] = args.lora_target_modules
     if args.moe_runner_backend != "auto":

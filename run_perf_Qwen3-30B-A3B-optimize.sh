@@ -118,7 +118,7 @@ kill_server
 #     --enable-lora \
 #     --lora-paths my_lora="$ADAPTER_PATH" \
 #     --max-lora-rank 32 \
-#     --lora-backend triton \
+#     --lora-backend csgmv \
 #     --moe-runner-backend triton \
 #     --experts-shared-outer-loras \
 #     --lora-use-virtual-experts \
@@ -140,7 +140,7 @@ launch_and_wait "Base + LoRA (CG, virtual experts)" \
     --enable-lora \
     --lora-paths my_lora="$ADAPTER_PATH" \
     --max-lora-rank 32 \
-    --lora-backend triton \
+    --lora-backend csgmv \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --lora-use-virtual-experts \

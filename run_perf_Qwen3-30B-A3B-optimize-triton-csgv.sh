@@ -14,25 +14,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR
 export PYTHONPATH="${PYTHONPATH:-}"
 
-MODEL_PATH="Qwen/Qwen3-8B"
-ADAPTER_PATH="${SCRIPT_DIR}/lora_test_cases/Qwen3-8B"
+MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507"
+ADAPTER_PATH="${SCRIPT_DIR}/lora_test_cases/Qwen3-30B-A3B-Instruct-2507"
 PORT=30000
 TP=4
 INPUT_LEN=1024
 OUTPUT_LEN=2048
 NUM_PROMPTS=30
-BATCH_SIZES=(1 2 4 8 16 32 64 128)
+BATCH_SIZES=(1 128 512)
 
-RESULT_DIR="${SCRIPT_DIR}/perf_results_Qwen3-8B"
+RESULT_DIR="${SCRIPT_DIR}/perf_results_Qwen3-30B-A3B-optimize"
 mkdir -p "$RESULT_DIR"
 
 echo "================================================================"
-echo "  Perf Benchmark: Qwen3-8B | NVIDIA GB300 | TP=${TP}"
+echo "  Perf Benchmark (LoRA backend comparison): Qwen3-30B-A3B | TP=${TP}"
 echo "  input_len=${INPUT_LEN}  output_len=${OUTPUT_LEN}"
 echo "  Scenarios:"
-echo "    1) Base (CG)           — no LoRA, CUDA Graph ON"
-echo "    2) Base + LoRA (no CG) — LoRA,    CUDA Graph OFF"
-echo "    3) Base + LoRA (CG)    — LoRA,    CUDA Graph ON"
+echo "    1) LoRA (triton)  — lora-backend=triton,  CG ON, virtual experts"
+echo "    2) LoRA (csgmv)   — lora-backend=csgmv,   CG ON, virtual experts"
 echo "================================================================"
 
 # ── Helper: launch server & wait ──────────────────────────────
@@ -94,22 +93,29 @@ run_bench() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  Scenario 1: Base (CG) — no LoRA, CUDA Graph ON
+#  Scenario 1: LoRA (triton) — lora-backend=triton, CG ON
 # ══════════════════════════════════════════════════════════════
-launch_and_wait "Base (CG)" \
+launch_and_wait "LoRA (triton, CG, virtual experts)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
+    --enable-lora \
+    --lora-paths my_lora="$ADAPTER_PATH" \
+    --max-lora-rank 32 \
+    --lora-backend triton \
+    --moe-runner-backend triton \
+    --experts-shared-outer-loras \
+    --lora-use-virtual-experts \
     --prefill-attention-backend fa4 \
-    --decode-attention-backend fa4 \
+    --decode-attention-backend fa4
 
-run_bench "base_cg" ""
+run_bench "lora_triton" "--lora-name my_lora"
 kill_server
 
 # ══════════════════════════════════════════════════════════════
-#  Scenario 2: Base + LoRA (no CG) — LoRA ON, CUDA Graph OFF
+#  Scenario 2: LoRA (csgmv) — lora-backend=csgmv, CG ON
 # ══════════════════════════════════════════════════════════════
-launch_and_wait "Base + LoRA (no CG)" \
+launch_and_wait "LoRA (csgmv, CG)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
@@ -117,30 +123,13 @@ launch_and_wait "Base + LoRA (no CG)" \
     --lora-paths my_lora="$ADAPTER_PATH" \
     --max-lora-rank 32 \
     --lora-backend csgmv \
-    --disable-radix \
-    --disable-cuda-graph \
+    --moe-runner-backend triton \
+    --experts-shared-outer-loras \
+    --lora-use-virtual-experts \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
-run_bench "lora_nocg" "--lora-name my_lora"
-kill_server
-
-# ══════════════════════════════════════════════════════════════
-#  Scenario 3: Base + LoRA (CG) — LoRA ON, CUDA Graph ON
-# ══════════════════════════════════════════════════════════════
-launch_and_wait "Base + LoRA (CG)" \
-    --model "$MODEL_PATH" \
-    --tp "$TP" \
-    --port "$PORT" \
-    --enable-lora \
-    --lora-paths my_lora="$ADAPTER_PATH" \
-    --max-lora-rank 32 \
-    --lora-backend csgmv \
-    --disable-radix \
-    --prefill-attention-backend fa4 \
-    --decode-attention-backend fa4
-
-run_bench "lora_cg" "--lora-name my_lora"
+run_bench "lora_csgmv" "--lora-name my_lora"
 kill_server
 
 # ══════════════════════════════════════════════════════════════
@@ -150,12 +139,12 @@ python3 - "$RESULT_DIR" <<'PYEOF'
 import json, os, sys
 
 result_dir = sys.argv[1]
-batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+batch_sizes = [1, 128, 512]
 scenarios = [
-    ("base_cg",   "Base (CG)"),
-    ("lora_nocg", "Base + LoRA (no CG)"),
-    ("lora_cg",   "Base + LoRA (CG)"),
+    ("lora_triton", "LoRA (triton)"),
+    ("lora_csgmv",  "LoRA (csgmv)"),
 ]
+baseline_tag = "lora_triton"
 
 def read_last(path):
     if not os.path.exists(path):
@@ -170,9 +159,9 @@ for tag, _ in scenarios:
     for bs in batch_sizes:
         data[tag][bs] = read_last(os.path.join(result_dir, f"{tag}_bs{bs}.jsonl"))
 
-W = 78
-hdr = f"{'bs':>4} | {'in_tput':>14} | {'out_tput':>14} | {'e2e_tps':>14} | {'vs Base':>8}"
-sep = f"{'-'*4}-+-{'-'*14}-+-{'-'*14}-+-{'-'*14}-+-{'-'*8}"
+W = 82
+hdr = f"{'bs':>4} | {'in_tput':>14} | {'out_tput':>14} | {'e2e_tps':>14} | {'vs triton':>10}"
+sep = f"{'-'*4}-+-{'-'*14}-+-{'-'*14}-+-{'-'*14}-+-{'-'*10}"
 
 for tag, label in scenarios:
     print()
@@ -183,12 +172,12 @@ for tag, label in scenarios:
     print(sep)
     for bs in batch_sizes:
         r = data[tag].get(bs)
-        base_r = data["base_cg"].get(bs)
+        base_r = data[baseline_tag].get(bs)
         if r:
             inp = r.get("input_throughput", 0)
             out = r.get("output_throughput", 0)
             tot = r.get("total_throughput", inp + out)
-            if tag == "base_cg":
+            if tag == baseline_tag:
                 ratio = "---"
             elif base_r:
                 base_tot = base_r.get("total_throughput",
@@ -196,9 +185,9 @@ for tag, label in scenarios:
                 ratio = f"{tot / base_tot * 100:.1f}%" if base_tot > 0 else "N/A"
             else:
                 ratio = "N/A"
-            print(f"{bs:>4} | {inp:>12.1f}/s | {out:>12.1f}/s | {tot:>12.1f}/s | {ratio:>8}")
+            print(f"{bs:>4} | {inp:>12.1f}/s | {out:>12.1f}/s | {tot:>12.1f}/s | {ratio:>10}")
         else:
-            print(f"{bs:>4} | {'N/A':>14} | {'N/A':>14} | {'N/A':>14} | {'N/A':>8}")
+            print(f"{bs:>4} | {'N/A':>14} | {'N/A':>14} | {'N/A':>14} | {'N/A':>10}")
     print("=" * W)
 
 print()
