@@ -76,6 +76,49 @@ convert_traces() {
     done
 }
 
+merge_tp_traces() {
+    local TRACE_DIR="$1"
+    log "Merging TP traces in: ${TRACE_DIR}"
+    python3 - "${TRACE_DIR}" << 'MERGE_PY'
+import sys, os, glob, re, logging
+logging.basicConfig(level=logging.INFO)
+from sglang.srt.utils.profile_merger import ProfileMerger
+
+trace_dir = sys.argv[1]
+for subdir_name in sorted(os.listdir(trace_dir)):
+    subdir_path = os.path.join(trace_dir, subdir_name)
+    if not os.path.isdir(subdir_path):
+        continue
+
+    all_traces = glob.glob(os.path.join(subdir_path, "*.trace.json.gz"))
+    tp_traces = [f for f in all_traces
+                 if "TP-" in os.path.basename(f)
+                 and "merged-" not in os.path.basename(f)]
+    if len(tp_traces) <= 1:
+        print(f"  Skipping {subdir_path}: only {len(tp_traces)} TP trace(s)")
+        continue
+
+    groups = {}
+    for f in tp_traces:
+        m = re.search(r"(\d+\.\d+)", os.path.basename(f))
+        if m:
+            groups.setdefault(m.group(1), []).append(f)
+
+    for pid, files in groups.items():
+        if len(files) <= 1:
+            continue
+        print(f"  Merging {len(files)} TP traces (profile_id={pid}) in {subdir_path}")
+        merger = ProfileMerger(subdir_path, pid)
+        # Override discovery to handle prefixed filenames
+        merger._discover_trace_files = lambda bound_files=files: bound_files
+        try:
+            merged_path = merger.merge_chrome_traces()
+            print(f"  -> {merged_path}")
+        except Exception as e:
+            print(f"  Merge failed for {pid}: {e}")
+MERGE_PY
+}
+
 # ══════════════════════════════════════════════════════════════
 #  Scenario 1: No LoRA — with CUDA Graph, fa4 attention
 # ══════════════════════════════════════════════════════════════
@@ -110,12 +153,14 @@ run_profile_no_lora_cg() {
         --num-prompts "$SERVE_NUM_PROMPTS" \
         --max-concurrency "$SERVE_MAX_CONCURRENCY" \
         --profile \
+        --profile-prefix no_lora_cg \
         --profile-output-dir "${PROFILE_DIR}" \
         2>&1 | tee "${PROFILE_DIR}/bench_serving.log"
 
     kill_server
     wait "${SERVER_PID}" 2>/dev/null || true
 
+    merge_tp_traces "${PROFILE_DIR}"
     convert_traces "${PROFILE_DIR}"
 
     log "No-LoRA + CG profile saved to: ${PROFILE_DIR}"
@@ -156,12 +201,14 @@ run_profile_no_lora_no_cg() {
         --num-prompts "$SERVE_NUM_PROMPTS" \
         --max-concurrency "$SERVE_MAX_CONCURRENCY" \
         --profile \
+        --profile-prefix no_lora_no_cg \
         --profile-output-dir "${PROFILE_DIR}" \
         2>&1 | tee "${PROFILE_DIR}/bench_serving.log"
 
     kill_server
     wait "${SERVER_PID}" 2>/dev/null || true
 
+    merge_tp_traces "${PROFILE_DIR}"
     convert_traces "${PROFILE_DIR}"
 
     log "No-LoRA + No-CG profile saved to: ${PROFILE_DIR}"
@@ -209,12 +256,14 @@ run_profile_lora_cg() {
         --max-concurrency "$SERVE_MAX_CONCURRENCY" \
         --lora-name my_lora \
         --profile \
+        --profile-prefix lora_cg \
         --profile-output-dir "${PROFILE_DIR}" \
         2>&1 | tee "${PROFILE_DIR}/bench_serving.log"
 
     kill_server
     wait "${SERVER_PID}" 2>/dev/null || true
 
+    merge_tp_traces "${PROFILE_DIR}"
     convert_traces "${PROFILE_DIR}"
 
     log "LoRA + CG profile saved to: ${PROFILE_DIR}"
@@ -263,12 +312,14 @@ run_profile_lora_no_cg() {
         --max-concurrency "$SERVE_MAX_CONCURRENCY" \
         --lora-name my_lora \
         --profile \
+        --profile-prefix lora_no_cg \
         --profile-output-dir "${PROFILE_DIR}" \
         2>&1 | tee "${PROFILE_DIR}/bench_serving.log"
 
     kill_server
     wait "${SERVER_PID}" 2>/dev/null || true
 
+    merge_tp_traces "${PROFILE_DIR}"
     convert_traces "${PROFILE_DIR}"
 
     log "LoRA + No-CG profile saved to: ${PROFILE_DIR}"
