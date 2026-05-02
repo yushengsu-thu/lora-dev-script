@@ -46,7 +46,7 @@ launch_and_wait() {
     python -m sglang.launch_server "$@" 2>&1 &
     SERVER_PID=$!
 
-    local MAX_WAIT=300 ELAPSED=0
+    local MAX_WAIT=600 ELAPSED=0
     while ! curl -s "http://localhost:${PORT}/health" > /dev/null 2>&1; do
         sleep 5; ELAPSED=$((ELAPSED + 5))
         if [ $ELAPSED -ge $MAX_WAIT ]; then
@@ -130,6 +130,7 @@ launch_and_wait "LoRA (csgmv, CG, virtual experts)" \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --lora-use-virtual-experts \
+    --no-record-nolora-graph \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
