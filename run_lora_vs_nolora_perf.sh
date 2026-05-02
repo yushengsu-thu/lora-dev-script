@@ -24,12 +24,13 @@ NUM_PROMPTS=30
 BATCH_SIZES=(1 128 512)
 WARMUP_PROMPTS=5
 
-RESULT_DIR="${SCRIPT_DIR}/perf_results_lora_vs_base"
+RESULT_DIR="${SCRIPT_DIR}/perf_results_lora_vs_nolora"
 mkdir -p "$RESULT_DIR"
 
 echo "================================================================"
-echo "  LoRA vs Base Model Perf (lora-perf-optimize-2)"
+echo "  LoRA vs No-LoRA Perf Comparison (lora-perf-optimize-2)"
 echo "  Model: Qwen3-30B-A3B | TP=${TP} | GPU: GB300"
+echo "  Backend: csgmv + virtual experts (best config)"
 echo "  input_len=${INPUT_LEN}  output_len=${OUTPUT_LEN}"
 echo "  Warmup: ${WARMUP_PROMPTS} requests before each measurement"
 echo "================================================================"
@@ -46,7 +47,7 @@ launch_and_wait() {
     python -m sglang.launch_server "$@" 2>&1 &
     SERVER_PID=$!
 
-    local MAX_WAIT=600 ELAPSED=0
+    local MAX_WAIT=300 ELAPSED=0
     while ! curl -s "http://localhost:${PORT}/health" > /dev/null 2>&1; do
         sleep 5; ELAPSED=$((ELAPSED + 5))
         if [ $ELAPSED -ge $MAX_WAIT ]; then
@@ -112,7 +113,8 @@ run_bench() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  Scenario 1: LoRA (csgmv + virtual experts, best config)
+#  Scenario 1: LoRA enabled (csgmv + virtual experts)
+#  Best config from run_compare_optimize1_vs_optimize2_csgmv.sh
 # ══════════════════════════════════════════════════════════════
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -130,22 +132,47 @@ launch_and_wait "LoRA (csgmv, CG, virtual experts)" \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --lora-use-virtual-experts \
-    --no-record-nolora-graph \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
 run_bench "lora" "--lora-name my_lora"
 kill_server
 
+# # ══════════════════════════════════════════════════════════════
+# #  Scenario 2: No LoRA (same server config but no adapter)
+# #  Uses nolora CUDA graph path (PR #22809)
+# # ══════════════════════════════════════════════════════════════
+# echo ""
+# echo "╔══════════════════════════════════════════════════════════════╗"
+# echo "║  Scenario 2: No LoRA (nolora CUDA graph)                   ║"
+# echo "╚══════════════════════════════════════════════════════════════╝"
+
+# launch_and_wait "No LoRA (csgmv server, nolora graph)" \
+#     --model "$MODEL_PATH" \
+#     --tp "$TP" \
+#     --port "$PORT" \
+#     --enable-lora \
+#     --lora-paths my_lora="$ADAPTER_PATH" \
+#     --max-lora-rank 32 \
+#     --lora-backend csgmv \
+#     --moe-runner-backend triton \
+#     --experts-shared-outer-loras \
+#     --lora-use-virtual-experts \
+#     --prefill-attention-backend fa4 \
+#     --decode-attention-backend fa4
+
+# run_bench "nolora" ""
+# kill_server
+
 # ══════════════════════════════════════════════════════════════
-#  Scenario 2: Pure base model (no LoRA at all)
+#  Scenario 3: Pure base model (no LoRA server at all)
 # ══════════════════════════════════════════════════════════════
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Scenario 2: Pure base model (no LoRA)                     ║"
+echo "║  Scenario 3: Pure base model (no LoRA enabled)             ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 
-launch_and_wait "Base model (no LoRA)" \
+launch_and_wait "Pure base model (no LoRA)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
@@ -165,8 +192,9 @@ import json, os, sys
 result_dir = sys.argv[1]
 batch_sizes = [1, 128, 512]
 scenarios = [
-    ("lora", "LoRA (csgmv+VE)"),
-    ("base", "Base (no LoRA)"),
+    ("lora",   "LoRA (csgmv+VE)"),
+    ("nolora", "NoLoRA (dual graph)"),
+    ("base",   "Pure base (no LoRA)"),
 ]
 
 def read_last(path):
@@ -182,26 +210,29 @@ for tag, _ in scenarios:
     for bs in batch_sizes:
         data[tag][bs] = read_last(os.path.join(result_dir, f"{tag}_bs{bs}.jsonl"))
 
-W = 105
+W = 120
+lora_tag = "lora"
+
 print()
 print("=" * W)
-print(f"  LoRA vs Base Model  (TP=4, in=1024, out=2048, NVIDIA GB300)")
-print(f"  Branch: lora-perf-optimize-2 | LoRA backend: csgmv + virtual experts")
+print(f"  LoRA vs No-LoRA Performance  (TP=4, in=1024, out=2048, NVIDIA GB300)")
+print(f"  Branch: lora-perf-optimize-2 | Backend: csgmv + virtual experts")
 print("=" * W)
 
 hdr = (f"{'bs':>4} |"
        f" {'LoRA in_tps':>13} | {'LoRA out_tps':>14} | {'LoRA total':>12} |"
-       f" {'Base in_tps':>13} | {'Base out_tps':>14} | {'Base total':>12} |"
-       f" {'LoRA/Base':>10}")
+       f" {'NoLoRA total':>13} | {'Base total':>12} |"
+       f" {'NoLoRA/LoRA':>12} | {'Base/LoRA':>10}")
 sep = (f"{'-'*4}-+-"
        f"{'-'*13}-+-{'-'*14}-+-{'-'*12}-+-"
-       f"{'-'*13}-+-{'-'*14}-+-{'-'*12}-+-"
-       f"{'-'*10}")
+       f"{'-'*13}-+-{'-'*12}-+-"
+       f"{'-'*12}-+-{'-'*10}")
 print(hdr)
 print(sep)
 
 for bs in batch_sizes:
     rl = data["lora"].get(bs)
+    rn = data["nolora"].get(bs)
     rb = data["base"].get(bs)
 
     def get_tput(r):
@@ -213,14 +244,16 @@ for bs in batch_sizes:
         return inp, out, tot
 
     l_in, l_out, l_tot = get_tput(rl)
-    b_in, b_out, b_tot = get_tput(rb)
+    _, _, n_tot = get_tput(rn)
+    _, _, b_tot = get_tput(rb)
 
-    ratio = f"{l_tot/b_tot*100:.1f}%" if b_tot > 0 and l_tot > 0 else "N/A"
+    n_ratio = f"{n_tot/l_tot:.2f}x" if l_tot > 0 and n_tot > 0 else "N/A"
+    b_ratio = f"{b_tot/l_tot:.2f}x" if l_tot > 0 and b_tot > 0 else "N/A"
 
     print(f"{bs:>4} |"
           f" {l_in:>11.1f}/s | {l_out:>12.1f}/s | {l_tot:>10.1f}/s |"
-          f" {b_in:>11.1f}/s | {b_out:>12.1f}/s | {b_tot:>10.1f}/s |"
-          f" {ratio:>10}")
+          f" {n_tot:>11.1f}/s | {b_tot:>10.1f}/s |"
+          f" {n_ratio:>12} | {b_ratio:>10}")
 
 print("=" * W)
 print()
