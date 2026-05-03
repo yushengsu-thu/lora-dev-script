@@ -1,993 +1,388 @@
 """
-Microbenchmark for _align_block_size_cuda_jit and optimized variants.
+Benchmark: _align_block_size_jit (CUDA JIT v2) vs _align_block_size_torch (PyTorch fallback)
 
-Measures kernel-level GPU time using CUDA events across different
-num_experts and numel (token count) configurations.
+Measures the wall-clock time of the align_block_size operation for large
+num_experts (> 1024), which is the hot path for LoRA virtual expert routing.
+
+Usage:
+    PYTHONPATH=/home/radixark/yushengsu/sglang/python python bench_align_block_size.py
 """
 
-import functools
 import time
-
 import torch
-from torch.utils.cpp_extension import load_inline
-
-# ─── V0: Current implementation (baseline) ────────────────────────────
-
-_V0_CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <algorithm>
-
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
-
-__global__ void align_large_kernel_v0(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad,
-    int32_t* __restrict__ cumsum_out,
-    int32_t num_experts,
-    int32_t block_size,
-    int32_t numel,
-    int32_t max_num_tokens_padded,
-    int32_t max_num_blocks)
-{
-    const int bucket_count = num_experts + 1;
-
-    if (blockIdx.x == 1) {
-        for (int i = threadIdx.x; i < max_num_tokens_padded; i += blockDim.x)
-            sorted_token_ids[i] = numel;
-        return;
-    }
-
-    extern __shared__ int32_t counts[];
-    const int tid = threadIdx.x;
-
-    for (int i = tid; i < bucket_count; i += blockDim.x)
-        counts[i] = 0;
-    __syncthreads();
-
-    for (int i = tid; i < numel; i += blockDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        atomicAdd(&counts[bucket], 1);
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        int running = 0;
-        for (int i = 0; i < bucket_count; i++) {
-            cumsum_out[i] = running;
-            running += CEILDIV(counts[i], block_size) * block_size;
-        }
-        cumsum_out[bucket_count] = running;
-        *total_tokens_post_pad = running;
-    }
-    __syncthreads();
-
-    for (int eid = tid; eid < num_experts; eid += blockDim.x) {
-        int start = cumsum_out[eid];
-        int end   = cumsum_out[eid + 1];
-        for (int j = start; j < end; j += block_size) {
-            int bidx = j / block_size;
-            if (bidx < max_num_blocks)
-                expert_ids[bidx] = eid;
-        }
-    }
-
-    int sentinel_start_block = cumsum_out[num_experts] / block_size;
-    for (int i = sentinel_start_block + tid; i < max_num_blocks; i += blockDim.x)
-        expert_ids[i] = -1;
-}
-
-__global__ void scatter_tokens_kernel_v0(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        int pos = atomicAdd(&cumsum[bucket], 1);
-        sorted_token_ids[pos] = i;
-    }
-}
-
-void align_block_size_v0(
-    torch::Tensor topk_ids,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    int64_t num_experts,
-    int64_t block_size,
-    int64_t max_num_tokens_padded,
-    int64_t max_num_blocks)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-    int numel = static_cast<int>(topk_ids.numel());
-    int bucket_count = static_cast<int>(num_experts) + 1;
-
-    int threads = 1024;
-    size_t smem_bytes = bucket_count * sizeof(int32_t);
-
-    align_large_kernel_v0<<<2, threads, smem_bytes, stream>>>(
-        topk_ids.data_ptr<int32_t>(),
-        sorted_token_ids.data_ptr<int32_t>(),
-        expert_ids.data_ptr<int32_t>(),
-        total_tokens_post_pad.data_ptr<int32_t>(),
-        cumsum_buffer.data_ptr<int32_t>(),
-        static_cast<int32_t>(num_experts),
-        static_cast<int32_t>(block_size),
-        numel,
-        static_cast<int32_t>(max_num_tokens_padded),
-        static_cast<int32_t>(max_num_blocks));
-
-    if (numel > 0) {
-        int scatter_threads = 256;
-        int scatter_blocks = std::min(
-            (numel + scatter_threads - 1) / scatter_threads, 65535);
-        scatter_tokens_kernel_v0<<<scatter_blocks, scatter_threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-}
-"""
-
-_V0_CPP_SRC = r"""
-void align_block_size_v0(
-    torch::Tensor topk_ids, torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids, torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    int64_t num_experts, int64_t block_size,
-    int64_t max_num_tokens_padded, int64_t max_num_blocks);
-"""
-
-# ─── V1: Parallel prefix-sum + multi-block histogram ──────────────────
-
-_V1_CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <algorithm>
-
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
-
-// Kernel 1: histogram (multi-block with global atomics)
-__global__ void histogram_kernel_v1(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ counts,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        atomicAdd(&counts[bucket], 1);
-    }
-}
-
-// Kernel 2: parallel prefix-sum + fill expert_ids
-//   Single block, up to 1024 threads.
-//   Each thread handles ceil(bucket_count / blockDim.x) buckets.
-//   Uses work-efficient Blelloch scan in shared memory.
-__global__ void prefix_sum_and_fill_v1(
-    int32_t* __restrict__ counts,
-    int32_t* __restrict__ cumsum_out,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad,
-    int32_t num_experts,
-    int32_t block_size,
-    int32_t max_num_blocks)
-{
-    const int bucket_count = num_experts + 1;
-    extern __shared__ int32_t smem[];
-    // smem layout: [0..bucket_count-1] = padded_counts for scan
-
-    const int tid = threadIdx.x;
-    const int n = bucket_count;
-
-    // Load padded counts into shared memory
-    for (int i = tid; i < n; i += blockDim.x) {
-        smem[i] = CEILDIV(counts[i], block_size) * block_size;
-    }
-    __syncthreads();
-
-    // Simple parallel prefix sum (sequential by thread 0 for correctness
-    // with arbitrary n that may not be power-of-2).
-    // For n up to ~4096 this is still fast since it's all in shared memory.
-    if (tid == 0) {
-        int running = 0;
-        for (int i = 0; i < n; i++) {
-            int val = smem[i];
-            cumsum_out[i] = running;
-            running += val;
-        }
-        cumsum_out[n] = running;
-        *total_tokens_post_pad = running;
-    }
-    __syncthreads();
-
-    // Fill expert_ids in parallel
-    for (int eid = tid; eid < num_experts; eid += blockDim.x) {
-        int start = cumsum_out[eid];
-        int end   = cumsum_out[eid + 1];
-        for (int j = start; j < end; j += block_size) {
-            int bidx = j / block_size;
-            if (bidx < max_num_blocks)
-                expert_ids[bidx] = eid;
-        }
-    }
-
-    int sentinel_start_block = cumsum_out[num_experts] / block_size;
-    for (int i = sentinel_start_block + tid; i < max_num_blocks; i += blockDim.x)
-        expert_ids[i] = -1;
-}
-
-// Kernel 3: fill sentinel + scatter (fused)
-__global__ void init_and_scatter_v1(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel,
-    int32_t max_num_tokens_padded)
-{
-    // Phase A: fill sorted_token_ids with sentinel
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < max_num_tokens_padded;
-         i += blockDim.x * gridDim.x) {
-        sorted_token_ids[i] = numel;
-    }
-    // Grid-wide barrier via cooperative groups is not available,
-    // so we split into two kernels or use atomics.
-    // Actually, sentinel fill and scatter are independent because
-    // scatter overwrites specific positions. Let's just do sentinel first.
-}
-
-__global__ void scatter_tokens_v1(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        int pos = atomicAdd(&cumsum[bucket], 1);
-        sorted_token_ids[pos] = i;
-    }
-}
-
-void align_block_size_v1(
-    torch::Tensor topk_ids,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    torch::Tensor counts_buffer,
-    int64_t num_experts,
-    int64_t block_size,
-    int64_t max_num_tokens_padded,
-    int64_t max_num_blocks)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-    int numel = static_cast<int>(topk_ids.numel());
-    int bucket_count = static_cast<int>(num_experts) + 1;
-
-    // Kernel 1: multi-block histogram
-    {
-        int threads = 256;
-        int blocks = std::min((numel + threads - 1) / threads, 256);
-        histogram_kernel_v1<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            counts_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-
-    // Kernel 2: prefix-sum + fill expert_ids (single block)
-    {
-        int threads = std::min(1024, bucket_count);
-        size_t smem = bucket_count * sizeof(int32_t);
-        prefix_sum_and_fill_v1<<<1, threads, smem, stream>>>(
-            counts_buffer.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            expert_ids.data_ptr<int32_t>(),
-            total_tokens_post_pad.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            static_cast<int32_t>(block_size),
-            static_cast<int32_t>(max_num_blocks));
-    }
-
-    // Kernel 3: fill sentinel
-    {
-        int threads = 256;
-        int blocks = std::min((int(max_num_tokens_padded) + threads - 1) / threads, 256);
-        init_and_scatter_v1<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel,
-            static_cast<int32_t>(max_num_tokens_padded));
-    }
-
-    // Kernel 4: scatter tokens
-    if (numel > 0) {
-        int threads = 256;
-        int blocks = std::min((numel + threads - 1) / threads, 65535);
-        scatter_tokens_v1<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-}
-"""
-
-_V1_CPP_SRC = r"""
-void align_block_size_v1(
-    torch::Tensor topk_ids, torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids, torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer, torch::Tensor counts_buffer,
-    int64_t num_experts, int64_t block_size,
-    int64_t max_num_tokens_padded, int64_t max_num_blocks);
-"""
-
-# ─── V2: Warp-level histogram reduction + fused 3-kernel pipeline ─────
-
-_V2_CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <algorithm>
-
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
-#define WARP_SIZE 32
-
-// Kernel 1: warp-level pre-aggregated histogram
-//   Each warp maintains a private histogram chunk in shared memory,
-//   reducing atomic contention on hot experts.
-__global__ void histogram_warp_v2(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ global_counts,
-    int32_t num_experts,
-    int32_t numel)
-{
-    const int bucket_count = num_experts + 1;
-    const int warp_id = threadIdx.x / WARP_SIZE;
-    const int lane_id = threadIdx.x % WARP_SIZE;
-    const int num_warps = blockDim.x / WARP_SIZE;
-
-    // Shared memory: per-warp histograms. Each warp has bucket_count slots.
-    // We cap shared memory usage: if bucket_count * num_warps > limit, fall back
-    // to global atomics directly.
-    extern __shared__ int32_t warp_hist[];
-
-    // Zero shared memory
-    for (int i = threadIdx.x; i < bucket_count * num_warps; i += blockDim.x)
-        warp_hist[i] = 0;
-    __syncthreads();
-
-    int32_t* my_hist = warp_hist + warp_id * bucket_count;
-
-    // Each thread processes elements in a grid-stride loop
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        atomicAdd(&my_hist[bucket], 1);
-    }
-    __syncthreads();
-
-    // Reduce per-warp histograms to global counts
-    // Each thread handles a slice of buckets
-    for (int b = threadIdx.x; b < bucket_count; b += blockDim.x) {
-        int sum = 0;
-        for (int w = 0; w < num_warps; w++)
-            sum += warp_hist[w * bucket_count + b];
-        if (sum > 0)
-            atomicAdd(&global_counts[b], sum);
-    }
-}
-
-// Kernel 2: prefix-sum + fill expert_ids (unchanged from V1)
-__global__ void prefix_sum_and_fill_v2(
-    int32_t* __restrict__ counts,
-    int32_t* __restrict__ cumsum_out,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad,
-    int32_t num_experts,
-    int32_t block_size,
-    int32_t max_num_blocks)
-{
-    const int tid = threadIdx.x;
-    const int bucket_count = num_experts + 1;
-
-    if (tid == 0) {
-        int running = 0;
-        for (int i = 0; i < bucket_count; i++) {
-            int val = CEILDIV(counts[i], block_size) * block_size;
-            cumsum_out[i] = running;
-            running += val;
-        }
-        cumsum_out[bucket_count] = running;
-        *total_tokens_post_pad = running;
-    }
-    __syncthreads();
-
-    for (int eid = tid; eid < num_experts; eid += blockDim.x) {
-        int start = cumsum_out[eid];
-        int end   = cumsum_out[eid + 1];
-        for (int j = start; j < end; j += block_size) {
-            int bidx = j / block_size;
-            if (bidx < max_num_blocks)
-                expert_ids[bidx] = eid;
-        }
-    }
-
-    int sentinel_start_block = cumsum_out[num_experts] / block_size;
-    for (int i = sentinel_start_block + tid; i < max_num_blocks; i += blockDim.x)
-        expert_ids[i] = -1;
-}
-
-// Kernel 3: sentinel fill
-__global__ void fill_sentinel_v2(
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t numel,
-    int32_t max_num_tokens_padded)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < max_num_tokens_padded;
-         i += blockDim.x * gridDim.x)
-        sorted_token_ids[i] = numel;
-}
-
-// Kernel 4: scatter tokens
-__global__ void scatter_tokens_v2(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        int pos = atomicAdd(&cumsum[bucket], 1);
-        sorted_token_ids[pos] = i;
-    }
-}
-
-void align_block_size_v2(
-    torch::Tensor topk_ids,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    torch::Tensor counts_buffer,
-    int64_t num_experts,
-    int64_t block_size,
-    int64_t max_num_tokens_padded,
-    int64_t max_num_blocks)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-    int numel = static_cast<int>(topk_ids.numel());
-    int bucket_count = static_cast<int>(num_experts) + 1;
-
-    // Kernel 1: warp-level histogram
-    {
-        int threads = 256;
-        int num_warps_per_block = threads / 32;
-        // Cap shared mem: per-warp histogram.
-        // If bucket_count * num_warps * 4 > 48KB, reduce blocks or fall back.
-        size_t smem = (size_t)bucket_count * num_warps_per_block * sizeof(int32_t);
-        int blocks;
-        if (smem > 48 * 1024) {
-            // Too much shared mem, use fewer warps
-            threads = 64;  // 2 warps
-            num_warps_per_block = 2;
-            smem = (size_t)bucket_count * num_warps_per_block * sizeof(int32_t);
-            blocks = std::min((numel + threads - 1) / threads, 64);
-        } else {
-            blocks = std::min((numel + threads - 1) / threads, 128);
-        }
-        histogram_warp_v2<<<blocks, threads, smem, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            counts_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-
-    // Kernel 2: prefix-sum + expert_ids fill
-    {
-        int threads = std::min(1024, bucket_count);
-        prefix_sum_and_fill_v2<<<1, threads, 0, stream>>>(
-            counts_buffer.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            expert_ids.data_ptr<int32_t>(),
-            total_tokens_post_pad.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            static_cast<int32_t>(block_size),
-            static_cast<int32_t>(max_num_blocks));
-    }
-
-    // Kernel 3: sentinel fill
-    {
-        int threads = 256;
-        int blocks = std::min(
-            (int(max_num_tokens_padded) + threads - 1) / threads, 256);
-        fill_sentinel_v2<<<blocks, threads, 0, stream>>>(
-            sorted_token_ids.data_ptr<int32_t>(),
-            numel,
-            static_cast<int32_t>(max_num_tokens_padded));
-    }
-
-    // Kernel 4: scatter
-    if (numel > 0) {
-        int threads = 256;
-        int blocks = std::min((numel + threads - 1) / threads, 65535);
-        scatter_tokens_v2<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-}
-"""
-
-_V2_CPP_SRC = r"""
-void align_block_size_v2(
-    torch::Tensor topk_ids, torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids, torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer, torch::Tensor counts_buffer,
-    int64_t num_experts, int64_t block_size,
-    int64_t max_num_tokens_padded, int64_t max_num_blocks);
-"""
-
-
-# ─── V3: V1 refined — fuse sentinel+scatter, multi-block expert fill ──
-
-_V3_CUDA_SRC = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <algorithm>
-
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
-
-// Kernel 1: multi-block histogram with global atomics
-__global__ void histogram_kernel_v3(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ counts,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        atomicAdd(&counts[bucket], 1);
-    }
-}
-
-// Kernel 2: prefix-sum (single block, thread-0) + multi-block expert_ids fill
-//   The prefix-sum part is fast for ~4K entries in shared memory.
-//   Expert_ids fill is parallelized: each thread handles one expert
-//   and writes all its blocks directly.
-__global__ void prefix_sum_and_fill_v3(
-    const int32_t* __restrict__ counts,
-    int32_t* __restrict__ cumsum_out,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad,
-    int32_t num_experts,
-    int32_t block_size,
-    int32_t max_num_blocks)
-{
-    const int tid = threadIdx.x;
-    const int bucket_count = num_experts + 1;
-
-    if (tid == 0) {
-        int running = 0;
-        for (int i = 0; i < bucket_count; i++) {
-            int val = CEILDIV(counts[i], block_size) * block_size;
-            cumsum_out[i] = running;
-            running += val;
-        }
-        cumsum_out[bucket_count] = running;
-        *total_tokens_post_pad = running;
-    }
-    __syncthreads();
-
-    // Fill expert_ids: each thread handles multiple experts in a stride loop
-    for (int eid = tid; eid < num_experts; eid += blockDim.x) {
-        int start_block = cumsum_out[eid] / block_size;
-        int end_block = cumsum_out[eid + 1] / block_size;
-        for (int b = start_block; b < end_block && b < max_num_blocks; b++)
-            expert_ids[b] = eid;
-    }
-
-    // Fill remaining blocks with -1
-    int sentinel_start_block = cumsum_out[num_experts] / block_size;
-    for (int i = sentinel_start_block + tid; i < max_num_blocks; i += blockDim.x)
-        expert_ids[i] = -1;
-}
-
-// Kernel 3: fused sentinel-fill + scatter
-//   Two-phase approach using a grid-wide flag:
-//   All blocks first fill their slice of sorted_token_ids with the sentinel,
-//   then a grid-wide __threadfence + atomic counter barrier, then scatter.
-//   ... Actually, a simpler approach: just launch fill + scatter in one kernel
-//   with a grid-stride loop that first fills, then scatters (since scatter
-//   only writes to valid positions, it will overwrite sentinels correctly).
-//
-//   Even simpler: fill the entire array with memset-like kernel, then scatter.
-//   Two kernels are fine — the overhead of 1 extra launch is ~2us.
-//   Let's fuse by having scatter overwrite sentinels.
-
-__global__ void fill_and_scatter_v3(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel,
-    int32_t max_num_tokens_padded)
-{
-    // Phase 1: fill entire sorted_token_ids with sentinel value
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < max_num_tokens_padded;
-         i += blockDim.x * gridDim.x)
-        sorted_token_ids[i] = numel;
-
-    // Grid-wide fence to ensure all sentinel writes are visible
-    __threadfence();
-
-    // We need a grid-wide barrier here. Since CUDA doesn't have one
-    // natively without cooperative groups, we use a simple approach:
-    // the last block to arrive triggers the scatter.
-    // Actually, this doesn't work cleanly. Let's use two kernels.
-    // The cost of an extra kernel launch (~2us) is small.
-}
-
-__global__ void scatter_tokens_v3(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ cumsum,
-    int32_t num_experts,
-    int32_t numel)
-{
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
-         i += blockDim.x * gridDim.x) {
-        int eid = topk_ids[i];
-        int bucket = (eid >= 0 && eid < num_experts) ? eid : num_experts;
-        int pos = atomicAdd(&cumsum[bucket], 1);
-        sorted_token_ids[pos] = i;
-    }
-}
-
-void align_block_size_v3(
-    torch::Tensor topk_ids,
-    torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids,
-    torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer,
-    torch::Tensor counts_buffer,
-    int64_t num_experts,
-    int64_t block_size,
-    int64_t max_num_tokens_padded,
-    int64_t max_num_blocks)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-    int numel = static_cast<int>(topk_ids.numel());
-    int bucket_count = static_cast<int>(num_experts) + 1;
-
-    // Kernel 1: multi-block histogram
-    {
-        int threads = 256;
-        int blocks = std::min((numel + threads - 1) / threads, 256);
-        histogram_kernel_v3<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            counts_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-
-    // Kernel 2: prefix-sum + expert_ids fill
-    {
-        int threads = std::min(1024, bucket_count);
-        prefix_sum_and_fill_v3<<<1, threads, 0, stream>>>(
-            counts_buffer.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            expert_ids.data_ptr<int32_t>(),
-            total_tokens_post_pad.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            static_cast<int32_t>(block_size),
-            static_cast<int32_t>(max_num_blocks));
-    }
-
-    // Kernel 3: sentinel fill (use max of numel and max_num_tokens_padded for grid)
-    {
-        int threads = 256;
-        int total_work = std::max((int)max_num_tokens_padded, numel);
-        int blocks = std::min((total_work + threads - 1) / threads, 512);
-        fill_and_scatter_v3<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel,
-            static_cast<int32_t>(max_num_tokens_padded));
-    }
-
-    // Kernel 4: scatter
-    if (numel > 0) {
-        int threads = 256;
-        int blocks = std::min((numel + threads - 1) / threads, 65535);
-        scatter_tokens_v3<<<blocks, threads, 0, stream>>>(
-            topk_ids.data_ptr<int32_t>(),
-            sorted_token_ids.data_ptr<int32_t>(),
-            cumsum_buffer.data_ptr<int32_t>(),
-            static_cast<int32_t>(num_experts),
-            numel);
-    }
-}
-"""
-
-_V3_CPP_SRC = r"""
-void align_block_size_v3(
-    torch::Tensor topk_ids, torch::Tensor sorted_token_ids,
-    torch::Tensor expert_ids, torch::Tensor total_tokens_post_pad,
-    torch::Tensor cumsum_buffer, torch::Tensor counts_buffer,
-    int64_t num_experts, int64_t block_size,
-    int64_t max_num_tokens_padded, int64_t max_num_blocks);
-"""
-
-
-# ─── Compilation ──────────────────────────────────────────────────────
-
-@functools.lru_cache(maxsize=1)
-def _compile_v0():
-    return load_inline(
-        name="bench_v0", cpp_sources=[_V0_CPP_SRC],
-        cuda_sources=[_V0_CUDA_SRC], functions=["align_block_size_v0"],
-        verbose=False,
+import triton
+
+torch.set_grad_enabled(False)
+
+# ─── Reference: pure-PyTorch implementation (the old slow path) ───
+
+@torch.compile(dynamic=True)
+def _align_block_size_torch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = topk_ids.device
+    flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
+    num_total_tokens = flat_topk_ids.numel()
+
+    sentinel = num_experts
+    valid_mask = (flat_topk_ids >= 0) & (flat_topk_ids < num_experts)
+    safe_topk_ids = torch.where(
+        valid_mask,
+        flat_topk_ids,
+        torch.full_like(flat_topk_ids, sentinel),
     )
 
-@functools.lru_cache(maxsize=1)
-def _compile_v1():
-    return load_inline(
-        name="bench_v1", cpp_sources=[_V1_CPP_SRC],
-        cuda_sources=[_V1_CUDA_SRC], functions=["align_block_size_v1"],
-        verbose=False,
-    )
-
-@functools.lru_cache(maxsize=1)
-def _compile_v2():
-    return load_inline(
-        name="bench_v2", cpp_sources=[_V2_CPP_SRC],
-        cuda_sources=[_V2_CUDA_SRC], functions=["align_block_size_v2"],
-        verbose=False,
-    )
-
-@functools.lru_cache(maxsize=1)
-def _compile_v3():
-    return load_inline(
-        name="bench_v3", cpp_sources=[_V3_CPP_SRC],
-        cuda_sources=[_V3_CUDA_SRC], functions=["align_block_size_v3"],
-        verbose=False,
-    )
-
-
-# ─── Runner wrappers ─────────────────────────────────────────────────
-
-def _make_buffers(numel, num_experts, block_size, device):
     bucket_count = num_experts + 1
-    max_total_padded = (
-        (numel + bucket_count * (block_size - 1) + block_size - 1)
+    max_total_padded_tokens = (
+        (num_total_tokens + bucket_count * (block_size - 1) + block_size - 1)
         // block_size
     ) * block_size
-    max_num_blocks = max_total_padded // block_size
+    max_num_blocks = max_total_padded_tokens // block_size
 
-    sorted_token_ids = torch.empty(max_total_padded, dtype=torch.int32, device=device)
-    expert_ids = torch.empty(max_num_blocks, dtype=torch.int32, device=device)
-    total_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=device)
-    cumsum_buffer = torch.zeros(bucket_count + 1, dtype=torch.int32, device=device)
-    counts_buffer = torch.zeros(bucket_count, dtype=torch.int32, device=device)
+    sorted_token_ids = torch.full(
+        (max_total_padded_tokens,), num_total_tokens, dtype=torch.int32, device=device,
+    )
+    expert_ids = torch.full(
+        (max_num_blocks,), -1, dtype=torch.int32, device=device,
+    )
 
-    return (sorted_token_ids, expert_ids, total_tokens_post_pad,
-            cumsum_buffer, counts_buffer, max_total_padded, max_num_blocks)
+    if num_total_tokens == 0:
+        num_tokens_post_padded = torch.zeros((1,), dtype=torch.int32, device=device)
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+    sorted_order = torch.argsort(safe_topk_ids)
+    sorted_expert_ids = safe_topk_ids[sorted_order]
+    expert_range = torch.arange(bucket_count, device=device, dtype=torch.int64)
+    counts_offsets = torch.searchsorted(sorted_expert_ids, expert_range, right=False)
+    counts_end = torch.searchsorted(sorted_expert_ids, expert_range, right=True)
+    counts = counts_end - counts_offsets
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    total_padded_tokens = padded_counts.sum().to(torch.int32).reshape(1)
+    padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
+
+    token_ranks = (
+        torch.arange(num_total_tokens, device=device, dtype=torch.int64)
+        - counts_offsets[sorted_expert_ids]
+    )
+    output_positions = padded_offsets[sorted_expert_ids] + token_ranks
+    sorted_token_ids.scatter_(
+        0, output_positions.to(torch.int64), sorted_order.to(torch.int32),
+    )
+
+    block_counts = padded_counts // block_size
+    real_block_counts = block_counts.clone()
+    real_block_counts[sentinel] = 0
+    actual_num_blocks = real_block_counts.sum()
+
+    if max_num_blocks <= 0:
+        return sorted_token_ids, expert_ids, total_padded_tokens
+
+    block_offsets = torch.cumsum(real_block_counts, dim=0)
+    all_block_positions = torch.arange(max_num_blocks, device=device, dtype=torch.int64)
+    assigned_experts = torch.searchsorted(
+        block_offsets, all_block_positions, right=True
+    ).to(torch.int32)
+    expert_ids.copy_(
+        torch.where(
+            all_block_positions < actual_num_blocks,
+            assigned_experts,
+            torch.full_like(assigned_experts, -1),
+        )
+    )
+
+    return sorted_token_ids, expert_ids, total_padded_tokens
 
 
-def run_v0(topk_ids, num_experts, block_size):
-    numel = topk_ids.numel()
+# ─── JIT v1: original (function-level import, 4 separate allocs) ───
+
+def _align_block_size_jit_v1(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.jit_kernel.moe_align import (
+        moe_align_block_size as jit_moe_align_block_size,
+    )
+
     device = topk_ids.device
-    (sorted_tok, expert_ids, total_post_pad,
-     cumsum_buf, _, max_padded, max_blocks) = _make_buffers(numel, num_experts, block_size, device)
+    flat_topk_ids = topk_ids.reshape(-1)
+    if flat_topk_ids.dtype == torch.int64:
+        flat_topk_ids = flat_topk_ids.to(torch.int32)
+    num_total_tokens = flat_topk_ids.numel()
 
-    mod = _compile_v0()
-    mod.align_block_size_v0(
-        topk_ids, sorted_tok, expert_ids, total_post_pad, cumsum_buf,
-        num_experts, block_size, max_padded, max_blocks)
-    return sorted_tok, expert_ids, total_post_pad
+    jit_num_experts = num_experts + 1
+
+    if num_total_tokens < jit_num_experts:
+        max_num_tokens_padded = num_total_tokens * block_size
+    else:
+        max_num_tokens_padded = num_total_tokens + jit_num_experts * (block_size - 1)
+
+    sorted_token_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    )
+    max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
+    expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=device
+    )
+    num_tokens_post_padded = torch.empty((1,), dtype=torch.int32, device=device)
+    cumsum_buffer = torch.empty(
+        (jit_num_experts + 1,), dtype=torch.int32, device=device
+    )
+
+    jit_moe_align_block_size(
+        flat_topk_ids,
+        jit_num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        cumsum_buffer,
+        True,
+    )
+
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
-def run_v1(topk_ids, num_experts, block_size):
-    numel = topk_ids.numel()
+# ─── JIT v2: optimized (module-level import, fused alloc, inline cdiv) ───
+
+from sglang.jit_kernel.moe_align import (
+    moe_align_block_size as _jit_moe_align_block_size,
+)
+
+def _align_block_size_jit_v2(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     device = topk_ids.device
-    (sorted_tok, expert_ids, total_post_pad,
-     cumsum_buf, counts_buf, max_padded, max_blocks) = _make_buffers(numel, num_experts, block_size, device)
+    flat_topk_ids = topk_ids.reshape(-1)
+    if flat_topk_ids.dtype == torch.int64:
+        flat_topk_ids = flat_topk_ids.to(torch.int32)
+    num_total_tokens = flat_topk_ids.numel()
 
-    mod = _compile_v1()
-    mod.align_block_size_v1(
-        topk_ids, sorted_tok, expert_ids, total_post_pad, cumsum_buf, counts_buf,
-        num_experts, block_size, max_padded, max_blocks)
-    return sorted_tok, expert_ids, total_post_pad
+    jit_num_experts = num_experts + 1
 
+    if num_total_tokens < jit_num_experts:
+        max_num_tokens_padded = num_total_tokens * block_size
+    else:
+        max_num_tokens_padded = num_total_tokens + jit_num_experts * (block_size - 1)
 
-def run_v2(topk_ids, num_experts, block_size):
-    numel = topk_ids.numel()
-    device = topk_ids.device
-    (sorted_tok, expert_ids, total_post_pad,
-     cumsum_buf, counts_buf, max_padded, max_blocks) = _make_buffers(numel, num_experts, block_size, device)
+    # Align to 4: CUDA kernel fills sorted_token_ids with int4 vec writes;
+    # last write can spill up to 3 int32s into adjacent expert_ids region.
+    max_num_tokens_padded = (max_num_tokens_padded + 3) & ~3
 
-    mod = _compile_v2()
-    mod.align_block_size_v2(
-        topk_ids, sorted_tok, expert_ids, total_post_pad, cumsum_buf, counts_buf,
-        num_experts, block_size, max_padded, max_blocks)
-    return sorted_tok, expert_ids, total_post_pad
+    max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
 
+    total_buf = max_num_tokens_padded + max_num_m_blocks + 1 + (jit_num_experts + 1)
+    buf = torch.empty(total_buf, dtype=torch.int32, device=device)
+    off = 0
+    sorted_token_ids = buf[off : off + max_num_tokens_padded]
+    off += max_num_tokens_padded
+    expert_ids = buf[off : off + max_num_m_blocks]
+    off += max_num_m_blocks
+    num_tokens_post_padded = buf[off : off + 1]
+    off += 1
+    cumsum_buffer = buf[off : off + jit_num_experts + 1]
 
-def run_v3(topk_ids, num_experts, block_size):
-    numel = topk_ids.numel()
-    device = topk_ids.device
-    (sorted_tok, expert_ids, total_post_pad,
-     cumsum_buf, counts_buf, max_padded, max_blocks) = _make_buffers(numel, num_experts, block_size, device)
+    _jit_moe_align_block_size(
+        flat_topk_ids,
+        jit_num_experts,
+        block_size,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        cumsum_buffer,
+        True,
+    )
 
-    mod = _compile_v3()
-    mod.align_block_size_v3(
-        topk_ids, sorted_tok, expert_ids, total_post_pad, cumsum_buf, counts_buf,
-        num_experts, block_size, max_padded, max_blocks)
-    return sorted_tok, expert_ids, total_post_pad
-
-
-# ─── Correctness check ───────────────────────────────────────────────
-
-def verify_correctness(topk_ids, num_experts, block_size):
-    """Check that V1, V2, V3 produce identical results to V0."""
-    s0, e0, t0 = run_v0(topk_ids.clone(), num_experts, block_size)
-    s1, e1, t1 = run_v1(topk_ids.clone(), num_experts, block_size)
-    s3, e3, t3 = run_v3(topk_ids.clone(), num_experts, block_size)
-
-    torch.cuda.synchronize()
-
-    t0_val = t0.item()
-    t1_val = t1.item()
-    t3_val = t3.item()
-
-    assert t0_val == t1_val, f"total_tokens mismatch V0={t0_val} vs V1={t1_val}"
-    assert t0_val == t3_val, f"total_tokens mismatch V0={t0_val} vs V3={t3_val}"
-
-    assert torch.equal(e0, e1), "expert_ids mismatch V0 vs V1"
-    assert torch.equal(e0, e3), "expert_ids mismatch V0 vs V3"
-
-    n = t0_val
-    s0_set = set(s0[:n].cpu().tolist())
-    s1_set = set(s1[:n].cpu().tolist())
-    s3_set = set(s3[:n].cpu().tolist())
-    assert s0_set == s1_set, "sorted_token_ids set mismatch V0 vs V1"
-    assert s0_set == s3_set, "sorted_token_ids set mismatch V0 vs V3"
-
-    print("  Correctness: PASS")
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
-# ─── Benchmark ────────────────────────────────────────────────────────
+# ─── Benchmark harness ───
 
-def benchmark_one(fn, topk_ids, num_experts, block_size, warmup=10, iters=100):
-    """Benchmark a single function, returns median GPU time in microseconds."""
-    # Warmup
+def make_topk_ids(num_tokens: int, top_k: int, num_experts: int,
+                  sentinel_ratio: float = 0.05, device: str = "cuda"):
+    """Generate realistic topk_ids with some sentinel (-1) values."""
+    ids = torch.randint(0, num_experts, (num_tokens, top_k), dtype=torch.int32, device=device)
+    mask = torch.rand(num_tokens, top_k, device=device) < sentinel_ratio
+    ids[mask] = -1
+    return ids
+
+
+def bench_fn(fn, topk_ids, block_size, num_experts, warmup=5, repeats=20):
+    """Time a function with CUDA synchronization."""
     for _ in range(warmup):
-        fn(topk_ids.clone(), num_experts, block_size)
+        fn(topk_ids, block_size, num_experts)
     torch.cuda.synchronize()
 
-    times = []
-    for _ in range(iters):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        ids_copy = topk_ids.clone()
-        start.record()
-        fn(ids_copy, num_experts, block_size)
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end) * 1000)  # ms -> us
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
+    end_events   = [torch.cuda.Event(enable_timing=True) for _ in range(repeats)]
 
-    times.sort()
-    median = times[len(times) // 2]
-    p10 = times[len(times) // 10]
-    p90 = times[int(len(times) * 0.9)]
-    return median, p10, p90
+    for i in range(repeats):
+        start_events[i].record()
+        fn(topk_ids, block_size, num_experts)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    times_ms.sort()
+    trimmed = times_ms[2:-2] if len(times_ms) > 4 else times_ms
+    avg = sum(trimmed) / len(trimmed)
+    return avg, min(times_ms), max(times_ms)
+
+
+def verify_correctness(topk_ids, block_size, num_experts):
+    """Check that JIT v2 and PyTorch produce compatible outputs."""
+    s_jit, e_jit, n_jit = _align_block_size_jit_v2(topk_ids, block_size, num_experts)
+    s_ref, e_ref, n_ref = _align_block_size_torch(topk_ids, block_size, num_experts)
+
+    n_jit_val = n_jit.item()
+    n_ref_val = n_ref.item()
+
+    n_jit_blocks = triton.cdiv(n_jit_val, block_size)
+    n_ref_blocks = triton.cdiv(n_ref_val, block_size)
+
+    # Collect which token ids land in each expert for both implementations
+    def get_expert_token_sets(sorted_ids, expert_ids, n_padded, bs):
+        n_blocks = triton.cdiv(n_padded, bs)
+        result = {}
+        for b in range(min(n_blocks, expert_ids.numel())):
+            eid = expert_ids[b].item()
+            if eid < 0:
+                continue
+            tokens = set()
+            for j in range(bs):
+                idx = b * bs + j
+                if idx < sorted_ids.numel():
+                    tid = sorted_ids[idx].item()
+                    num_total = topk_ids.numel()
+                    if tid < num_total:
+                        tokens.add(tid)
+            if eid not in result:
+                result[eid] = set()
+            result[eid].update(tokens)
+        return result
+
+    jit_map = get_expert_token_sets(s_jit, e_jit, n_jit_val, block_size)
+    ref_map = get_expert_token_sets(s_ref, e_ref, n_ref_val, block_size)
+
+    all_experts = set(jit_map.keys()) | set(ref_map.keys())
+    mismatches = 0
+    for eid in all_experts:
+        jit_tokens = jit_map.get(eid, set())
+        ref_tokens = ref_map.get(eid, set())
+        if jit_tokens != ref_tokens:
+            mismatches += 1
+            if mismatches <= 3:
+                print(f"    MISMATCH expert {eid}: "
+                      f"jit has {len(jit_tokens)} tokens, ref has {len(ref_tokens)} tokens, "
+                      f"diff: {jit_tokens.symmetric_difference(ref_tokens)}")
+
+    return mismatches == 0
 
 
 def main():
-    device = torch.device("cuda")
-
-    print("Compiling CUDA kernels...")
-    t0 = time.time()
-    _compile_v0()
-    print(f"  V0 compiled in {time.time() - t0:.1f}s")
-    t0 = time.time()
-    _compile_v1()
-    print(f"  V1 compiled in {time.time() - t0:.1f}s")
-    t0 = time.time()
-    _compile_v3()
-    print(f"  V3 compiled in {time.time() - t0:.1f}s")
-
-    block_size = 64  # typical BLOCK_SIZE_M
+    device = "cuda"
+    print("=" * 100)
+    print("  Benchmark: JIT v2 (optimized) vs JIT v1 (original) vs PyTorch fallback")
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print("  v1 = function-level import + 4x torch.empty + triton.cdiv")
+    print("  v2 = module-level import + fused alloc + inline cdiv")
+    print("=" * 100)
 
     configs = [
-        # (num_experts, num_tokens, top_k, description)
-        (1024,  512,  8, "1024 experts, 512 tokens, top8"),
-        (1024,  4096, 8, "1024 experts, 4K tokens, top8"),
-        (1024,  16384, 8, "1024 experts, 16K tokens, top8"),
-        (2048,  512,  8, "2048 experts, 512 tokens, top8"),
-        (2048,  4096, 8, "2048 experts, 4K tokens, top8"),
-        (2048,  16384, 8, "2048 experts, 16K tokens, top8"),
-        (4096,  512,  8, "4096 experts, 512 tokens, top8"),
-        (4096,  4096, 8, "4096 experts, 4K tokens, top8"),
-        (4096,  16384, 8, "4096 experts, 16K tokens, top8"),
+        (64,   2, 1024,  64, "8E×128L, 64tok"),
+        (256,  2, 1024,  64, "8E×128L, 256tok"),
+        (1024, 2, 1024,  64, "8E×128L, 1024tok"),
+        (64,   2, 2048,  64, "8E×256L, 64tok"),
+        (256,  2, 2048,  64, "8E×256L, 256tok"),
+        (1024, 2, 2048,  64, "8E×256L, 1024tok"),
+        (64,   2, 4096,  64, "64E×64L, 64tok"),
+        (256,  2, 4096,  64, "64E×64L, 256tok"),
+        (1024, 2, 4096,  64, "64E×64L, 1024tok"),
+        (1,    2, 2048,  64, "8E×256L, 1tok (decode)"),
+        (4,    2, 2048,  64, "8E×256L, 4tok (decode)"),
+        (16,   2, 2048,  64, "8E×256L, 16tok (decode)"),
     ]
 
-    versions = [
-        ("V0 (baseline)", run_v0),
-        ("V1 (multi-blk)", run_v1),
-        ("V3 (refined)", run_v3),
-    ]
+    # ── Phase 1: Correctness ──
+    print("\n── Phase 1: Correctness verification (v2 vs torch) ──")
+    print("  (Warming up torch.compile, first call may be slow...)\n")
+    test_ids = make_topk_ids(128, 2, 2048, device=device)
+    _align_block_size_torch(test_ids, 64, 2048)
+    _align_block_size_torch(test_ids, 64, 2048)
+
+    all_correct = True
+    for num_tokens, top_k, num_experts, block_size, label in configs:
+        topk_ids = make_topk_ids(num_tokens, top_k, num_experts, device=device)
+        ok = verify_correctness(topk_ids, block_size, num_experts)
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] {label:30s}  (E={num_experts}, N={num_tokens}×{top_k}, BS={block_size})")
+        if not ok:
+            all_correct = False
+
+    if not all_correct:
+        print("\n  WARNING: Some correctness checks failed!")
+    else:
+        print("\n  All correctness checks passed.")
+
+    # ── Phase 2: Performance ──
+    print("\n── Phase 2: Performance benchmark (50 repeats each) ──")
+    print(f"  {'Config':<30s} | {'v2(opt) avg':>10s} | {'v1(orig) avg':>11s} | {'Torch avg':>10s} | {'v2/v1':>6s} | {'v2/Torch':>8s}")
+    print("  " + "-" * 30 + "-+-" + "-" * 10 + "-+-" + "-" * 11 + "-+-" + "-" * 10 + "-+-" + "-" * 6 + "-+-" + "-" * 8)
+
+    for num_tokens, top_k, num_experts, block_size, label in configs:
+        topk_ids = make_topk_ids(num_tokens, top_k, num_experts, device=device)
+
+        v2_avg, v2_min, v2_max = bench_fn(
+            _align_block_size_jit_v2, topk_ids, block_size, num_experts,
+            warmup=10, repeats=50,
+        )
+        v1_avg, v1_min, v1_max = bench_fn(
+            _align_block_size_jit_v1, topk_ids, block_size, num_experts,
+            warmup=10, repeats=50,
+        )
+        torch_avg, torch_min, torch_max = bench_fn(
+            _align_block_size_torch, topk_ids, block_size, num_experts,
+            warmup=5, repeats=30,
+        )
+
+        v1_speedup = v1_avg / v2_avg if v2_avg > 0 else float('inf')
+        torch_speedup = torch_avg / v2_avg if v2_avg > 0 else float('inf')
+
+        print(f"  {label:<30s} | "
+              f"{v2_avg:>8.3f}ms | "
+              f"{v1_avg:>9.3f}ms | "
+              f"{torch_avg:>8.3f}ms | "
+              f"{v1_speedup:>5.2f}x | "
+              f"{torch_speedup:>6.2f}x")
+
+    # ── Phase 3: High-frequency simulation ──
+    print("\n── Phase 3: 100K-call simulation (BS=1 decode scenario) ──")
+    print("  Simulating 48 MoE layers × 2048 decode steps = ~100K calls\n")
+
+    topk_ids = make_topk_ids(1, 2, 2048, device=device)
+    num_calls = 100_000
+
+    for name, fn in [("JIT v2 (optimized)", _align_block_size_jit_v2),
+                     ("JIT v1 (original)",  _align_block_size_jit_v1)]:
+        # warmup
+        for _ in range(100):
+            fn(topk_ids, 64, 2048)
+        torch.cuda.synchronize()
+
+        start = time.perf_counter()
+        for _ in range(num_calls):
+            fn(topk_ids, 64, 2048)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+
+        print(f"  {name:<25s}: {elapsed*1000:>8.1f}ms total, {elapsed/num_calls*1e6:>6.2f}µs/call")
 
     print("\n" + "=" * 100)
-    print(f"  align_block_size Benchmark | block_size={block_size} | GPU: {torch.cuda.get_device_name()}")
-    print("=" * 100)
-
-    header = f"{'Config':<42} |"
-    for name, _ in versions:
-        header += f" {name:>18} |"
-    header += " V1 speedup | V3 speedup"
-    print(header)
-    print("-" * len(header))
-
-    for num_experts, num_tokens, top_k, desc in configs:
-        numel = num_tokens * top_k
-        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k),
-                                 dtype=torch.int32, device=device).reshape(-1)
-
-        verify_correctness(topk_ids, num_experts, block_size)
-
-        row = f"  {desc:<40} |"
-        medians = []
-        for name, fn in versions:
-            median, p10, p90 = benchmark_one(fn, topk_ids, num_experts, block_size)
-            row += f" {median:>13.1f} us |"
-            medians.append(median)
-
-        if medians[0] > 0:
-            row += f"  {medians[0]/medians[1]:>9.2f}x"
-            row += f"  | {medians[0]/medians[2]:>8.2f}x"
-        print(row)
-
-    print("=" * 100)
-    print("Done.")
+    print("  Done.")
 
 
 if __name__ == "__main__":
