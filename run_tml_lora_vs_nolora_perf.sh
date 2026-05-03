@@ -160,7 +160,6 @@ launch_and_wait "Pure base model (no LoRA)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
-    --moe-runner-backend triton \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
