@@ -1,4 +1,4 @@
-pkill -9 sglang
+pkill -9 sglang 2>/dev/null || true
 sleep 3
 ray stop --force 2>/dev/null || true
 pkill -9 ray 2>/dev/null || true
@@ -24,16 +24,21 @@ NUM_PROMPTS=30
 BATCH_SIZES=(1 128 512)
 WARMUP_PROMPTS=5
 
-RESULT_DIR="${SCRIPT_DIR}/perf_results_lora_vs_nolora"
+SGLANG_DIR="${SCRIPT_DIR}/sglang"
+BRANCH="lora-perf-optimize-2"
+RESULT_DIR="${SCRIPT_DIR}/perf_results_csgmv_${BRANCH}"
 mkdir -p "$RESULT_DIR"
 
 echo "================================================================"
-echo "  LoRA vs No-LoRA Perf Comparison (lora-perf-optimize-2)"
-echo "  Model: Qwen3-30B-A3B | TP=${TP} | GPU: GB300"
-echo "  Backend: csgmv + virtual experts (best config)"
+echo "  csgmv Perf: ${BRANCH} | Qwen3-30B-A3B | TP=${TP}"
 echo "  input_len=${INPUT_LEN}  output_len=${OUTPUT_LEN}"
+echo "  Backend: csgmv  (CG ON, virtual experts)"
 echo "  Warmup: ${WARMUP_PROMPTS} requests before each measurement"
 echo "================================================================"
+
+cd "$SGLANG_DIR"
+git checkout "$BRANCH"
+cd "$SCRIPT_DIR"
 
 launch_and_wait() {
     local LABEL="$1"; shift
@@ -113,15 +118,14 @@ run_bench() {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  Scenario 1: LoRA enabled (csgmv + virtual experts)
-#  Best config from run_compare_optimize1_vs_optimize2_csgmv.sh
+#  LoRA (csgmv, CG, virtual experts) on lora-perf-optimize-2
 # ══════════════════════════════════════════════════════════════
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Scenario 1: LoRA (csgmv + virtual experts)                ║"
+echo "║  Branch: ${BRANCH}  (csgmv, virtual experts)               ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 
-launch_and_wait "LoRA (csgmv, CG, virtual experts)" \
+launch_and_wait "LoRA (csgmv, CG, virtual experts) [${BRANCH}]" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
@@ -135,67 +139,18 @@ launch_and_wait "LoRA (csgmv, CG, virtual experts)" \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4
 
-run_bench "lora" "--lora-name my_lora"
-kill_server
-
-# # ══════════════════════════════════════════════════════════════
-# #  Scenario 2: No LoRA (same server config but no adapter)
-# #  Uses nolora CUDA graph path (PR #22809)
-# # ══════════════════════════════════════════════════════════════
-# echo ""
-# echo "╔══════════════════════════════════════════════════════════════╗"
-# echo "║  Scenario 2: No LoRA (nolora CUDA graph)                   ║"
-# echo "╚══════════════════════════════════════════════════════════════╝"
-
-# launch_and_wait "No LoRA (csgmv server, nolora graph)" \
-#     --model "$MODEL_PATH" \
-#     --tp "$TP" \
-#     --port "$PORT" \
-#     --enable-lora \
-#     --lora-paths my_lora="$ADAPTER_PATH" \
-#     --max-lora-rank 32 \
-#     --lora-backend csgmv \
-#     --moe-runner-backend triton \
-#     --experts-shared-outer-loras \
-#     --lora-use-virtual-experts \
-#     --prefill-attention-backend fa4 \
-#     --decode-attention-backend fa4
-
-# run_bench "nolora" ""
-# kill_server
-
-# ══════════════════════════════════════════════════════════════
-#  Scenario 3: Pure base model (no LoRA server at all)
-# ══════════════════════════════════════════════════════════════
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Scenario 3: Pure base model (no LoRA enabled)             ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-
-launch_and_wait "Pure base model (no LoRA)" \
-    --model "$MODEL_PATH" \
-    --tp "$TP" \
-    --port "$PORT" \
-    --moe-runner-backend triton \
-    --prefill-attention-backend fa4 \
-    --decode-attention-backend fa4
-
-run_bench "base" ""
+run_bench "lora_csgmv" "--lora-name my_lora"
 kill_server
 
 # ══════════════════════════════════════════════════════════════
-#  Generate comparison table
+#  Print results
 # ══════════════════════════════════════════════════════════════
 python3 - "$RESULT_DIR" <<'PYEOF'
 import json, os, sys
 
 result_dir = sys.argv[1]
 batch_sizes = [1, 128, 512]
-scenarios = [
-    ("lora",   "LoRA (csgmv+VE)"),
-    ("nolora", "NoLoRA (dual graph)"),
-    ("base",   "Pure base (no LoRA)"),
-]
+tag = "lora_csgmv"
 
 def read_last(path):
     if not os.path.exists(path):
@@ -204,57 +159,24 @@ def read_last(path):
         lines = [l.strip() for l in f if l.strip()]
     return json.loads(lines[-1]) if lines else None
 
-data = {}
-for tag, _ in scenarios:
-    data[tag] = {}
-    for bs in batch_sizes:
-        data[tag][bs] = read_last(os.path.join(result_dir, f"{tag}_bs{bs}.jsonl"))
-
-W = 120
-lora_tag = "lora"
-
+W = 82
 print()
 print("=" * W)
-print(f"  LoRA vs No-LoRA Performance  (TP=4, in=1024, out=2048, NVIDIA GB300)")
-print(f"  Branch: lora-perf-optimize-2 | Backend: csgmv + virtual experts")
+print(f"  LoRA (csgmv)  lora-perf-optimize-2  (TP=4, in=1024, out=2048, GB300)")
 print("=" * W)
-
-hdr = (f"{'bs':>4} |"
-       f" {'LoRA in_tps':>13} | {'LoRA out_tps':>14} | {'LoRA total':>12} |"
-       f" {'NoLoRA total':>13} | {'Base total':>12} |"
-       f" {'NoLoRA/LoRA':>12} | {'Base/LoRA':>10}")
-sep = (f"{'-'*4}-+-"
-       f"{'-'*13}-+-{'-'*14}-+-{'-'*12}-+-"
-       f"{'-'*13}-+-{'-'*12}-+-"
-       f"{'-'*12}-+-{'-'*10}")
+hdr = f"{'bs':>4} | {'in_tput':>14} | {'out_tput':>14} | {'e2e_tps':>14}"
+sep = f"{'-'*4}-+-{'-'*14}-+-{'-'*14}-+-{'-'*14}"
 print(hdr)
 print(sep)
-
 for bs in batch_sizes:
-    rl = data["lora"].get(bs)
-    rn = data["nolora"].get(bs)
-    rb = data["base"].get(bs)
-
-    def get_tput(r):
-        if not r:
-            return 0, 0, 0
+    r = read_last(os.path.join(result_dir, f"{tag}_bs{bs}.jsonl"))
+    if r:
         inp = r.get("input_throughput", 0)
         out = r.get("output_throughput", 0)
         tot = r.get("total_throughput", inp + out)
-        return inp, out, tot
-
-    l_in, l_out, l_tot = get_tput(rl)
-    _, _, n_tot = get_tput(rn)
-    _, _, b_tot = get_tput(rb)
-
-    n_ratio = f"{n_tot/l_tot:.2f}x" if l_tot > 0 and n_tot > 0 else "N/A"
-    b_ratio = f"{b_tot/l_tot:.2f}x" if l_tot > 0 and b_tot > 0 else "N/A"
-
-    print(f"{bs:>4} |"
-          f" {l_in:>11.1f}/s | {l_out:>12.1f}/s | {l_tot:>10.1f}/s |"
-          f" {n_tot:>11.1f}/s | {b_tot:>10.1f}/s |"
-          f" {n_ratio:>12} | {b_ratio:>10}")
-
+        print(f"{bs:>4} | {inp:>12.1f}/s | {out:>12.1f}/s | {tot:>12.1f}/s")
+    else:
+        print(f"{bs:>4} | {'N/A':>14} | {'N/A':>14} | {'N/A':>14}")
 print("=" * W)
 print()
 PYEOF
