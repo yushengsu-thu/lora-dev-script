@@ -18,27 +18,30 @@ MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507"
 ADAPTER_PATH="${SCRIPT_DIR}/lora_test_cases/Qwen3-30B-A3B-Instruct-2507"
 PORT=30000
 TP=4
-NUM_PROMPTS=30
-WARMUP_PROMPTS=5
 
+NUM_RUNS=3
 RESULT_DIR="${SCRIPT_DIR}/perf_results_tml_lora_vs_nolora"
 REPORT_FILE="${RESULT_DIR}/bench_report.md"
 mkdir -p "$RESULT_DIR"
+rm -f "${RESULT_DIR}"/*.jsonl
 
+# Test scenarios: NAME:NUM_PROMPTS:BS:INPUT_LEN:OUTPUT_LEN
 echo "================================================================"
 echo "  LoRA vs No-LoRA TML Perf Comparison (lora-perf-optimize-3)"
 echo "  Model: Qwen3-30B-A3B | TP=${TP} | GPU: GB300"
 echo "  Backend: csgmv + virtual experts"
-echo "  Test matrix: bs={1,256} x in={256,4096} x out={2,256}"
-echo "  Warmup: ${WARMUP_PROMPTS} requests before each measurement"
 echo "================================================================"
-
-# Test scenarios: NAME:BATCH_SIZE:INPUT_LEN:OUTPUT_LEN
 SCENARIOS=(
-    "single:1:256:256"
-    "prefill_short:1:256:2"
-    "prefill_long:1:4096:2"
-    "decode_medium:256:256:256"
+    # ── Low Latency (BS=1) ──
+    "lat_prefill_short:1:1:256:2"
+    "lat_prefill_long:1:1:4096:2"
+    "lat_prefill_8k:1:1:8192:2"
+    "lat_prefill_16k:1:1:16384:2"
+    "lat_decode:1:1:256:256"
+    # ── High Throughput (BS=64) ──
+    "tput_bs64_np64:64:64:256:256"
+    "tput_bs64_np128:128:64:256:256"
+    "tput_bs64_np256:256:64:256:256"
 )
 
 launch_and_wait() {
@@ -70,22 +73,24 @@ kill_server() {
     echo "  Stopping server..."
     kill -9 $SERVER_PID 2>/dev/null
     pkill -9 sglang 2>/dev/null
-    sleep 5
+    pkill -9 python 2>/dev/null
+    sleep 15
 }
 
 run_warmup() {
     local LORA_ARG="$1"
-    local BS="$2"
-    local IN_LEN="$3"
-    local OUT_LEN="$4"
-    echo "  >> Warmup: ${WARMUP_PROMPTS} reqs (BS=${BS}, in=${IN_LEN}, out=${OUT_LEN})..."
+    local NP="$2"
+    local BS="$3"
+    local IN_LEN="$4"
+    local OUT_LEN="$5"
+    echo "  >> Warmup: ${NP} reqs (BS=${BS}, in=${IN_LEN}, out=${OUT_LEN})..."
     PYTHONPATH="${SCRIPT_DIR}/sglang/python:$PYTHONPATH" \
     python -m sglang.bench_serving \
         --backend sglang \
         --port "$PORT" \
         --model "$MODEL_PATH" \
         --dataset-name random \
-        --num-prompts "$WARMUP_PROMPTS" \
+        --num-prompts "$NP" \
         --random-input-len "$IN_LEN" \
         --random-output-len "$OUT_LEN" \
         --request-rate inf \
@@ -100,26 +105,28 @@ run_bench_scenarios() {
     local LORA_ARG="$2"
 
     for SCENARIO in "${SCENARIOS[@]}"; do
-        IFS=':' read -r NAME BS IN_LEN OUT_LEN <<< "$SCENARIO"
+        IFS=':' read -r NAME NP BS IN_LEN OUT_LEN <<< "$SCENARIO"
         local TAG="${PREFIX}_${NAME}"
 
-        run_warmup "$LORA_ARG" "$BS" "$IN_LEN" "$OUT_LEN"
+        run_warmup "$LORA_ARG" "$NP" "$BS" "$IN_LEN" "$OUT_LEN"
 
-        echo "  >> [${TAG}] BS=${BS} in=${IN_LEN} out=${OUT_LEN} (measurement)"
-        PYTHONPATH="${SCRIPT_DIR}/sglang/python:$PYTHONPATH" \
-        python -m sglang.bench_serving \
-            --backend sglang \
-            --port "$PORT" \
-            --model "$MODEL_PATH" \
-            --dataset-name random \
-            --num-prompts "$NUM_PROMPTS" \
-            --random-input-len "$IN_LEN" \
-            --random-output-len "$OUT_LEN" \
-            --request-rate inf \
-            --max-concurrency "$BS" \
-            ${LORA_ARG} \
-            --output-file "${RESULT_DIR}/${TAG}.jsonl" \
-            --disable-tqdm
+        for RUN in $(seq 1 "$NUM_RUNS"); do
+            echo "  >> [${TAG}] Run ${RUN}/${NUM_RUNS} num_prompts=${NP} BS=${BS} in=${IN_LEN} out=${OUT_LEN}"
+            PYTHONPATH="${SCRIPT_DIR}/sglang/python:$PYTHONPATH" \
+            python -m sglang.bench_serving \
+                --backend sglang \
+                --port "$PORT" \
+                --model "$MODEL_PATH" \
+                --dataset-name random \
+                --num-prompts "$NP" \
+                --random-input-len "$IN_LEN" \
+                --random-output-len "$OUT_LEN" \
+                --request-rate inf \
+                --max-concurrency "$BS" \
+                ${LORA_ARG} \
+                --output-file "${RESULT_DIR}/${TAG}.jsonl" \
+                --disable-tqdm
+        done
     done
 }
 
@@ -135,6 +142,7 @@ launch_and_wait "LoRA (csgmv, CG, virtual experts)" \
     --model "$MODEL_PATH" \
     --tp "$TP" \
     --port "$PORT" \
+    --mem-fraction-static 0.95 \
     --enable-lora \
     --lora-paths my_lora="$ADAPTER_PATH" \
     --max-lora-rank 32 \
@@ -176,98 +184,131 @@ result_dir = sys.argv[1]
 report_file = sys.argv[2]
 
 scenarios = [
-    ("single",        1,   256, 256),
-    ("prefill_short", 1,   256,   2),
-    ("prefill_long",  1,  4096,   2),
-    ("decode_medium", 256, 256, 256),
+    # (name, num_prompts, bs, input_len, output_len)
+    # Low Latency (BS=1)
+    ("lat_prefill_short",    1,    1,   256,   2),
+    ("lat_prefill_long",     1,    1,  4096,   2),
+    ("lat_prefill_8k",       1,    1,  8192,   2),
+    ("lat_prefill_16k",      1,    1, 16384,   2),
+    ("lat_decode",           1,    1,   256, 256),
+    # High Throughput (BS=64)
+    ("tput_bs64_np64",      64,   64,   256, 256),
+    ("tput_bs64_np128",    128,   64,   256, 256),
+    ("tput_bs64_np256",    256,   64,   256, 256),
 ]
 
-def read_last(path):
+METRIC_KEYS = [
+    ("completed",  "completed"),
+    ("duration",   "duration"),
+    ("req_tput",   "request_throughput"),
+    ("in_tput",    "input_throughput"),
+    ("out_tput",   "output_throughput"),
+    ("total_tput", "total_throughput"),
+    ("mean_e2e",   "mean_e2e_latency_ms"),
+    ("median_e2e", "median_e2e_latency_ms"),
+    ("p99_e2e",    "p99_e2e_latency_ms"),
+    ("mean_ttft",  "mean_ttft_ms"),
+    ("median_ttft","median_ttft_ms"),
+    ("p99_ttft",   "p99_ttft_ms"),
+    ("mean_tpot",  "mean_tpot_ms"),
+    ("median_tpot","median_tpot_ms"),
+    ("p99_tpot",   "p99_tpot_ms"),
+    ("mean_itl",   "mean_itl_ms"),
+    ("median_itl", "median_itl_ms"),
+    ("p99_itl",    "p99_itl_ms"),
+]
+
+def read_avg(path):
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        lines = [l.strip() for l in f if l.strip()]
-    return json.loads(lines[-1]) if lines else None
+        records = [json.loads(l) for l in f if l.strip()]
+    if not records:
+        return None
+    avg = {}
+    for short, raw in METRIC_KEYS:
+        vals = [r[raw] for r in records if isinstance(r.get(raw), (int, float))]
+        avg[short] = sum(vals) / len(vals) if vals else 0
+    avg["num_runs"] = len(records)
+    return avg
 
-def fmt(v, suffix=""):
-    return f"{v:,.2f}{suffix}" if v else "N/A"
+TABLE_HDR = "| number_of_prompts | BS | in_len | out_len | runs | completed | dur(s) | req/s | in_tok/s | out_tok/s | total_tok/s | mean_e2e(ms) | med_e2e | p99_e2e | mean_ttft(ms) | med_ttft | p99_ttft | mean_tpot(ms) | med_tpot | p99_tpot | mean_itl(ms) | med_itl | p99_itl |"
+TABLE_SEP = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
 
-def get_metrics(r):
-    if not r:
-        return {}
-    return {
-        "dur": r.get("duration", 0),
-        "lat": r.get("mean_e2e_latency_ms", 0) / 1000 if r.get("mean_e2e_latency_ms") else r.get("mean_e2e_latency", 0),
-        "lat99": r.get("p99_e2e_latency_ms", 0) / 1000 if r.get("p99_e2e_latency_ms") else r.get("p99_e2e_latency", 0),
-        "ttft": r.get("mean_ttft_ms", 0) / 1000 if r.get("mean_ttft_ms") else r.get("mean_ttft", 0),
-        "ttft99": r.get("p99_ttft_ms", 0) / 1000 if r.get("p99_ttft_ms") else r.get("p99_ttft", 0),
-        "tpot": r.get("mean_tpot_ms", 0) / 1000 if r.get("mean_tpot_ms") else r.get("mean_tpot", 0),
-        "tpot99": r.get("p99_tpot_ms", 0) / 1000 if r.get("p99_tpot_ms") else r.get("p99_tpot", 0),
-        "in_tput": r.get("input_throughput", 0),
-        "out_tput": r.get("output_throughput", 0),
-        "ext_tput": r.get("total_throughput", 0),
-        "dec_tput": r.get("decode_throughput", 0),
-    }
-
-TABLE_HDR = "| batch_size | input_len | output_len | dur | lat | lat99 | ttft | ttft99 | tpot | tpot99 | in_tput | out_tput | ext_tput | dec_tput |"
-TABLE_SEP = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
-
-def table_row(bs, in_len, out_len, m):
+def table_row(np, bs, in_len, out_len, m):
     if not m:
-        return f"| {bs} | {in_len} | {out_len} | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |"
+        return f"| {np} | {bs} | {in_len} | {out_len} |" + " N/A |" * 19
     return (
-        f"| {bs} | {in_len} | {out_len} "
-        f"| {m['dur']:.2f} | {m['lat']:.2f} | {m['lat99']:.2f} "
-        f"| {m['ttft']:.4f} | {m['ttft99']:.4f} "
-        f"| {m['tpot']:.4f} | {m['tpot99']:.4f} "
-        f"| {fmt(m['in_tput'])} | {fmt(m['out_tput'])} "
-        f"| {fmt(m['ext_tput'])} | {fmt(m['dec_tput'])} |"
+        f"| {np} | {bs} | {in_len} | {out_len} "
+        f"| {m['num_runs']} | {m['completed']:.0f} | {m['duration']:.2f} | {m['req_tput']:.2f} "
+        f"| {m['in_tput']:.2f} | {m['out_tput']:.2f} | {m['total_tput']:.2f} "
+        f"| {m['mean_e2e']:.2f} | {m['median_e2e']:.2f} | {m['p99_e2e']:.2f} "
+        f"| {m['mean_ttft']:.2f} | {m['median_ttft']:.2f} | {m['p99_ttft']:.2f} "
+        f"| {m['mean_tpot']:.2f} | {m['median_tpot']:.2f} | {m['p99_tpot']:.2f} "
+        f"| {m['mean_itl']:.2f} | {m['median_itl']:.2f} | {m['p99_itl']:.2f} |"
     )
 
 lines = []
-lines.append(f"** tp=4 dp=1 ep=1")
+lines.append(f"** tp=4 dp=1 ep=1 | All metrics are averaged over multiple runs per scenario")
 lines.append("")
 
-for prefix, label in [("lora", ""), ("nolora", "nolora_")]:
-    for name, bs, in_len, out_len in scenarios:
-        section = f"{label}{name}" if label else name
+for prefix, title in [("lora", "LoRA"), ("nolora", "Base Model (no LoRA)")]:
+    lines.append(f"## {title}")
+    lines.append("")
+    lines.append(TABLE_HDR)
+    lines.append(TABLE_SEP)
+    for name, np, bs, in_len, out_len in scenarios:
         tag = f"{prefix}_{name}"
-        r = read_last(os.path.join(result_dir, f"{tag}.jsonl"))
-        m = get_metrics(r)
+        m = read_avg(os.path.join(result_dir, f"{tag}.jsonl"))
+        lines.append(table_row(np, bs, in_len, out_len, m))
+    lines.append("")
 
-        lines.append(f"## {section}")
-        lines.append("")
-        lines.append(TABLE_HDR)
-        lines.append(TABLE_SEP)
-        lines.append(table_row(bs, in_len, out_len, m if m else None))
-        lines.append("")
+def ratio(a, b):
+    return f"{a / b:.2f}x" if b else "—"
+
+CMP_HDR = "| number_of_prompts | BS | in | out | lora_mean_e2e(ms) | base_mean_e2e(ms) | e2e_ratio | lora_mean_ttft(ms) | base_mean_ttft(ms) | ttft_ratio | lora_mean_tpot(ms) | base_mean_tpot(ms) | tpot_ratio | lora_mean_itl(ms) | base_mean_itl(ms) | itl_ratio | lora_total_tok/s | base_total_tok/s | tput_ratio |"
+CMP_SEP = "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+
+def cmp_row(np, bs, in_len, out_len, lm, bm):
+    return (
+        f"| {np} | {bs} | {in_len} | {out_len} "
+        f"| {lm['mean_e2e']:.2f} | {bm['mean_e2e']:.2f} | {ratio(lm['mean_e2e'], bm['mean_e2e'])} "
+        f"| {lm['mean_ttft']:.2f} | {bm['mean_ttft']:.2f} | {ratio(lm['mean_ttft'], bm['mean_ttft'])} "
+        f"| {lm['mean_tpot']:.2f} | {bm['mean_tpot']:.2f} | {ratio(lm['mean_tpot'], bm['mean_tpot'])} "
+        f"| {lm['mean_itl']:.2f} | {bm['mean_itl']:.2f} | {ratio(lm['mean_itl'], bm['mean_itl'])} "
+        f"| {lm['total_tput']:.2f} | {bm['total_tput']:.2f} | {ratio(lm['total_tput'], bm['total_tput'])} |"
+    )
+
+lat_scenarios = [(n, np, bs, il, ol) for n, np, bs, il, ol in scenarios if bs == 1]
+tput_scenarios = [(n, np, bs, il, ol) for n, np, bs, il, ol in scenarios if bs > 1]
 
 lines.append("")
-lines.append("## LoRA vs Base Model Comparison")
+lines.append("## Low Latency (BS=1) — LoRA vs Base")
 lines.append("")
-lines.append("| scenario | batch_size | input_len | output_len | lora_ext_tput | base_ext_tput | tput % of base | lora_ttft | base_ttft | ttft % of base | lora_tpot | base_tpot | tpot % of base | lora_dec_tput | base_dec_tput | dec_tput % of base |")
-lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+lines.append("> Key metric: `e2e_ratio` = lora_mean_e2e / base_mean_e2e — closer to 1.0x is better")
+lines.append("")
+lines.append(CMP_HDR)
+lines.append(CMP_SEP)
 
-for name, bs, in_len, out_len in scenarios:
-    lr = read_last(os.path.join(result_dir, f"lora_{name}.jsonl"))
-    br = read_last(os.path.join(result_dir, f"nolora_{name}.jsonl"))
-    lm = get_metrics(lr)
-    bm = get_metrics(br)
-
+for name, np, bs, in_len, out_len in lat_scenarios:
+    lm = read_avg(os.path.join(result_dir, f"lora_{name}.jsonl"))
+    bm = read_avg(os.path.join(result_dir, f"nolora_{name}.jsonl"))
     if lm and bm:
-        tput_pct = f"{lm['ext_tput'] / bm['ext_tput'] * 100:.1f}%" if bm.get("ext_tput") else "N/A"
-        ttft_pct = f"{bm['ttft'] / lm['ttft'] * 100:.1f}%" if lm.get("ttft") else "N/A"
-        tpot_pct = f"{bm['tpot'] / lm['tpot'] * 100:.1f}%" if lm.get("tpot") else "N/A"
-        dec_pct  = f"{lm['dec_tput'] / bm['dec_tput'] * 100:.1f}%" if bm.get("dec_tput") else "N/A"
-        lines.append(
-            f"| {name} | {bs} | {in_len} | {out_len} "
-            f"| {fmt(lm['ext_tput'])} | {fmt(bm['ext_tput'])} | {tput_pct} "
-            f"| {lm['ttft']:.4f} | {bm['ttft']:.4f} | {ttft_pct} "
-            f"| {lm['tpot']:.4f} | {bm['tpot']:.4f} | {tpot_pct} "
-            f"| {fmt(lm['dec_tput'])} | {fmt(bm['dec_tput'])} | {dec_pct} |"
-        )
-    else:
-        lines.append(f"| {name} | {bs} | {in_len} | {out_len} | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |")
+        lines.append(cmp_row(np, bs, in_len, out_len, lm, bm))
+
+lines.append("")
+lines.append("## High Throughput (BS=64) — LoRA vs Base")
+lines.append("")
+lines.append("> Key metric: `tput_ratio` = lora_total_tok/s / base_total_tok/s — closer to 1.0x is better")
+lines.append("")
+lines.append(CMP_HDR)
+lines.append(CMP_SEP)
+
+for name, np, bs, in_len, out_len in tput_scenarios:
+    lm = read_avg(os.path.join(result_dir, f"lora_{name}.jsonl"))
+    bm = read_avg(os.path.join(result_dir, f"nolora_{name}.jsonl"))
+    if lm and bm:
+        lines.append(cmp_row(np, bs, in_len, out_len, lm, bm))
 
 lines.append("")
 
