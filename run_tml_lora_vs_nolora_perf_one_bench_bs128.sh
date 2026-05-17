@@ -88,9 +88,10 @@ process_profiles() {
         echo ""
         echo "  ── Profile post-processing: ${PROFILE_SUBDIR}"
 
-        echo "  [1/4] Converting traces to Perfetto-compatible format..."
+        echo "  [1/4] Converting traces to Perfetto-compatible format (skipping bs-1)..."
         for f in "$PROFILE_SUBDIR"/*.trace.json.gz; do
             [[ -f "$f" ]] || continue
+            [[ "$(basename "$f")" == *bs-1-* ]] && continue
             echo "    → $(basename "$f")"
             python3 "$CONVERT_SCRIPT" \
                 "$(basename "$f")" \
@@ -105,6 +106,7 @@ process_profiles() {
         local PROFILE_ID=""
         for f in "${PROFILE_SUBDIR%/}"/*-TP-0.trace.json.gz; do
             [[ -f "$f" ]] || continue
+            [[ "$(basename "$f")" == *bs-1-* ]] && continue
             PROFILE_ID=$(basename "$f" | grep -oP '\d{10,}\.\d+')
             break
         done
@@ -114,6 +116,7 @@ process_profiles() {
                 local bname
                 bname=$(basename "$f")
                 [[ "$bname" == perfetto-compatible-* ]] && continue
+                [[ "$bname" == *bs-1-* ]] && continue
                 local tp_part
                 tp_part=$(echo "$bname" | grep -oP 'TP-\d+')
                 ln -sf "$bname" "${PROFILE_SUBDIR%/}/${PROFILE_ID}-${tp_part}.trace.json.gz"
@@ -136,11 +139,16 @@ process_profiles() {
                 --dir-data "${PROFILE_SUBDIR%/}" || true
         done
 
-        echo "  [4/4] Cleaning up intermediate files (keeping only perfetto-compatible)..."
+        echo "  [4/4] Cleaning up intermediate files and bs-1 results..."
         for f in "${PROFILE_SUBDIR%/}"/*.trace.json.gz; do
             [[ -f "$f" ]] || continue
             local bname
             bname=$(basename "$f")
+            if [[ "$bname" == *bs-1-* ]]; then
+                rm -f "$f"
+                echo "    rm $(basename "$f") (bs-1)"
+                continue
+            fi
             [[ "$bname" == perfetto-compatible-* ]] && continue
             rm -f "$f"
             echo "    rm $(basename "$f")"
