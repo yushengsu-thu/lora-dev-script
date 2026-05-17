@@ -42,6 +42,12 @@ SKIP_NOLORA="${SKIP_NOLORA:-0}"
 # the whole forward pass is visible on one timeline, which is what we usually
 # want for LoRA-vs-noLoRA comparisons.
 PROFILE_BY_STAGE="${PROFILE_BY_STAGE:-0}"
+# PROFILE_STEPS = number of forward passes to capture. sglang's default is 5,
+# which is FAR too few for BS=128 in combined mode: chunked prefill of 128×2048
+# tokens (chunked_prefill_size=16384 ⇒ ~14336 tok/chunk) needs ~19 forward
+# passes just to finish prefill, so 5 steps captures ZERO decode. Default 30
+# comfortably covers all prefill chunks + ~10 decode steps on the BS=128 shape.
+PROFILE_STEPS="${PROFILE_STEPS:-30}"
 mkdir -p "$RESULT_DIR"
 rm -f "${RESULT_DIR}"/*.jsonl
 
@@ -73,7 +79,8 @@ echo "  Model: ${MODEL_PATH} | TP=${TP}"
 echo "  BSs: ${BATCH_SIZES[*]}  (first ${NUM_WARMUP} = warmup, max-running-requests=${MAX_BS})"
 echo "  input_len=${INPUT_LEN}  output_len=${OUTPUT_LEN}"
 echo "  LoRA backend: ${LORA_BACKEND}  skip_server_warmup=${SKIP_SERVER_WARMUP}"
-echo "  profile_by_stage=${PROFILE_BY_STAGE}  skip_lora=${SKIP_LORA}  skip_nolora=${SKIP_NOLORA}"
+echo "  profile_by_stage=${PROFILE_BY_STAGE}  profile_steps=${PROFILE_STEPS}"
+echo "  skip_lora=${SKIP_LORA}  skip_nolora=${SKIP_NOLORA}"
 echo "================================================================"
 
 cleanup() {
@@ -235,6 +242,7 @@ run_bench() {
         --skip-warmup \
         --show-report \
         --profile \
+        --profile-steps "$PROFILE_STEPS" \
         "${PROFILE_BY_STAGE_ARG[@]}" \
         --profile-output-dir "$PROFILE_OUTPUT" \
         "$@" 2>&1 | tee "$SERVER_LOG"
