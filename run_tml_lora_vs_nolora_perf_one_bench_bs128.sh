@@ -88,25 +88,62 @@ process_profiles() {
         echo ""
         echo "  ── Profile post-processing: ${PROFILE_SUBDIR}"
 
-        echo "  [1/3] Converting traces to Perfetto-compatible format..."
+        echo "  [1/4] Converting traces to Perfetto-compatible format..."
         for f in "$PROFILE_SUBDIR"/*.trace.json.gz; do
             [[ -f "$f" ]] || continue
             echo "    → $(basename "$f")"
             python3 "$CONVERT_SCRIPT" \
-                --filename "$(basename "$f")" \
+                "$(basename "$f")" \
                 --dir-data "${PROFILE_SUBDIR%/}" || true
         done
 
-        echo "  [2/3] Merging TP rank traces..."
-        python3 "$MERGER_SCRIPT" --dir-data "${PROFILE_SUBDIR%/}" || true
+        echo "  [2/4] Merging TP rank traces..."
+        # The merger expects filenames starting with a numeric profile_id
+        # (e.g. "1779022238.3597927-TP-0.trace.json.gz"), but sglang outputs
+        # "bs-128-il-2048-1779022238.3597927-TP-0.trace.json.gz".
+        # Create temporary symlinks with the expected naming pattern.
+        local PROFILE_ID=""
+        for f in "${PROFILE_SUBDIR%/}"/*-TP-0.trace.json.gz; do
+            [[ -f "$f" ]] || continue
+            PROFILE_ID=$(basename "$f" | grep -oP '\d{10,}\.\d+')
+            break
+        done
+        if [[ -n "$PROFILE_ID" ]]; then
+            for f in "${PROFILE_SUBDIR%/}"/*-${PROFILE_ID}-TP-*.trace.json.gz; do
+                [[ -f "$f" ]] || continue
+                local bname
+                bname=$(basename "$f")
+                [[ "$bname" == perfetto-compatible-* ]] && continue
+                local tp_part
+                tp_part=$(echo "$bname" | grep -oP 'TP-\d+')
+                ln -sf "$bname" "${PROFILE_SUBDIR%/}/${PROFILE_ID}-${tp_part}.trace.json.gz"
+            done
+            python3 "$MERGER_SCRIPT" --dir-data "${PROFILE_SUBDIR%/}" || true
+            # Remove temporary symlinks
+            for f in "${PROFILE_SUBDIR%/}"/${PROFILE_ID}-TP-*.trace.json.gz; do
+                [[ -L "$f" ]] && rm -f "$f"
+            done
+        else
+            echo "    Could not extract profile_id, skipping merge."
+        fi
 
-        echo "  [3/3] Converting merged trace to Perfetto-compatible format..."
+        echo "  [3/4] Converting merged trace to Perfetto-compatible format..."
         for f in "$PROFILE_SUBDIR"/merged-*.trace.json.gz; do
             [[ -f "$f" ]] || continue
             echo "    → $(basename "$f")"
             python3 "$CONVERT_SCRIPT" \
-                --filename "$(basename "$f")" \
+                "$(basename "$f")" \
                 --dir-data "${PROFILE_SUBDIR%/}" || true
+        done
+
+        echo "  [4/4] Cleaning up intermediate files (keeping only perfetto-compatible)..."
+        for f in "${PROFILE_SUBDIR%/}"/*.trace.json.gz; do
+            [[ -f "$f" ]] || continue
+            local bname
+            bname=$(basename "$f")
+            [[ "$bname" == perfetto-compatible-* ]] && continue
+            rm -f "$f"
+            echo "    rm $(basename "$f")"
         done
     done
 
@@ -115,20 +152,6 @@ process_profiles() {
     else
         echo "  Profile post-processing complete for ${SCENARIO}"
     fi
-
-    # Remove bs=1 warmup profile subdirectories to save space
-    for PROFILE_SUBDIR in "$PROFILE_BASE"/*/; do
-        [[ -d "$PROFILE_SUBDIR" ]] || continue
-        local has_non_warmup=0
-        for f in "$PROFILE_SUBDIR"/*.trace.json.gz; do
-            [[ -f "$f" ]] || continue
-            [[ "$(basename "$f")" != bs-1-* ]] && has_non_warmup=1 && break
-        done
-        if (( has_non_warmup == 0 )); then
-            echo "  Removing bs=1 warmup profile dir: ${PROFILE_SUBDIR}"
-            rm -rf "$PROFILE_SUBDIR"
-        fi
-    done
 }
 
 run_bench() {
@@ -212,6 +235,6 @@ echo "  Done.  All results in: ${RESULT_DIR}"
 echo "  Benchmark:  ${RESULT_DIR}/{lora,nolora}.jsonl"
 echo "  Server logs: ${RESULT_DIR}/{lora,nolora}.server.log"
 echo "  Profiles:    ${RESULT_DIR}/profile_{lora,nolora}/"
-echo "    (perfetto-compatible-*.json.gz = converted traces)"
-echo "    (merged-*.json.gz             = TP-merged traces)"
+echo "    (perfetto-compatible-*.json.gz       = per-TP converted traces)"
+echo "    (perfetto-compatible-merged-*.json.gz = TP-merged + converted)"
 echo "================================================================"
