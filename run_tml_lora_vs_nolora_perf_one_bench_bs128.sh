@@ -115,6 +115,20 @@ process_profiles() {
     else
         echo "  Profile post-processing complete for ${SCENARIO}"
     fi
+
+    # Remove bs=1 warmup profile subdirectories to save space
+    for PROFILE_SUBDIR in "$PROFILE_BASE"/*/; do
+        [[ -d "$PROFILE_SUBDIR" ]] || continue
+        local has_non_warmup=0
+        for f in "$PROFILE_SUBDIR"/*.trace.json.gz; do
+            [[ -f "$f" ]] || continue
+            [[ "$(basename "$f")" != bs-1-* ]] && has_non_warmup=1 && break
+        done
+        if (( has_non_warmup == 0 )); then
+            echo "  Removing bs=1 warmup profile dir: ${PROFILE_SUBDIR}"
+            rm -rf "$PROFILE_SUBDIR"
+        fi
+    done
 }
 
 run_bench() {
