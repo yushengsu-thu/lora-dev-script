@@ -98,36 +98,72 @@ process_profiles() {
                 --dir-data "${PROFILE_SUBDIR%/}" || true
         done
 
-        echo "  [2/4] Merging TP rank traces..."
+        echo "  [2/4] Merging TP rank traces (stage-aware)..."
         # The merger expects filenames starting with a numeric profile_id
         # (e.g. "1779022238.3597927-TP-0.trace.json.gz"), but sglang outputs
-        # "bs-128-il-2048-1779022238.3597927-TP-0.trace.json.gz".
+        # "bs-128-il-2048-1779022238.3597927-TP-0[-<stage>].trace.json.gz".
         # Create temporary symlinks with the expected naming pattern.
-        local PROFILE_ID=""
-        for f in "${PROFILE_SUBDIR%/}"/*-TP-0.trace.json.gz; do
+        declare -A MERGE_TARGETS=()
+        for f in "${PROFILE_SUBDIR%/}"/*.trace.json.gz; do
             [[ -f "$f" ]] || continue
-            [[ "$(basename "$f")" == *bs-1-* ]] && continue
-            PROFILE_ID=$(basename "$f" | grep -oP '\d{10,}\.\d+')
-            break
+            local bname
+            bname=$(basename "$f")
+            [[ "$bname" == perfetto-compatible-* ]] && continue
+            [[ "$bname" == merged-* ]] && continue
+            [[ "$bname" == *bs-1-* ]] && continue
+            local extracted_profile_id
+            extracted_profile_id=$(echo "$bname" | grep -oP '\d{10,}\.\d+' | head -n 1)
+            [[ -z "$extracted_profile_id" ]] && continue
+
+            local stage_tag="all"
+            if [[ "$bname" =~ -(EXTEND|DECODE|prefill|decode)\.trace\.json\.gz$ ]]; then
+                stage_tag="${BASH_REMATCH[1]}"
+            fi
+            MERGE_TARGETS["${stage_tag}:${extracted_profile_id}"]=1
         done
-        if [[ -n "$PROFILE_ID" ]]; then
-            for f in "${PROFILE_SUBDIR%/}"/*-${PROFILE_ID}-TP-*.trace.json.gz; do
-                [[ -f "$f" ]] || continue
-                local bname
-                bname=$(basename "$f")
-                [[ "$bname" == perfetto-compatible-* ]] && continue
-                [[ "$bname" == *bs-1-* ]] && continue
-                local tp_part
-                tp_part=$(echo "$bname" | grep -oP 'TP-\d+')
-                ln -sf "$bname" "${PROFILE_SUBDIR%/}/${PROFILE_ID}-${tp_part}.trace.json.gz"
-            done
-            python3 "$MERGER_SCRIPT" --dir-data "${PROFILE_SUBDIR%/}" || true
-            # Remove temporary symlinks
-            for f in "${PROFILE_SUBDIR%/}"/${PROFILE_ID}-TP-*.trace.json.gz; do
-                [[ -L "$f" ]] && rm -f "$f"
-            done
-        else
+
+        if (( ${#MERGE_TARGETS[@]} == 0 )); then
             echo "    Could not extract profile_id, skipping merge."
+        else
+            for merge_key in "${!MERGE_TARGETS[@]}"; do
+                local stage_tag profile_id_for_merge
+                IFS=':' read -r stage_tag profile_id_for_merge <<< "$merge_key"
+
+                local merge_profile_id="$profile_id_for_merge"
+                [[ "$stage_tag" != "all" ]] && merge_profile_id="${profile_id_for_merge}-${stage_tag}"
+
+                local linked=0
+                for f in "${PROFILE_SUBDIR%/}"/*-${profile_id_for_merge}-TP-*.trace.json.gz; do
+                    [[ -f "$f" ]] || continue
+                    local bname
+                    bname=$(basename "$f")
+                    [[ "$bname" == perfetto-compatible-* ]] && continue
+                    [[ "$bname" == merged-* ]] && continue
+                    [[ "$bname" == *bs-1-* ]] && continue
+
+                    if [[ "$stage_tag" == "all" ]]; then
+                        [[ "$bname" =~ -(EXTEND|DECODE|prefill|decode)\.trace\.json\.gz$ ]] && continue
+                    else
+                        [[ "$bname" =~ -${stage_tag}\.trace\.json\.gz$ ]] || continue
+                    fi
+
+                    local tp_part
+                    tp_part=$(echo "$bname" | grep -oP 'TP-\d+')
+                    [[ -z "$tp_part" ]] && continue
+                    ln -sf "$bname" "${PROFILE_SUBDIR%/}/${merge_profile_id}-${tp_part}.trace.json.gz"
+                    (( linked++ ))
+                done
+
+                if (( linked > 0 )); then
+                    python3 "$MERGER_SCRIPT" \
+                        --dir-data "${PROFILE_SUBDIR%/}" \
+                        --profile-id "${merge_profile_id}" || true
+                    # Remove temporary symlinks
+                    for f in "${PROFILE_SUBDIR%/}"/${merge_profile_id}-TP-*.trace.json.gz; do
+                        [[ -L "$f" ]] && rm -f "$f"
+                    done
+                fi
+            done
         fi
 
         echo "  [3/4] Converting merged trace to Perfetto-compatible format..."
@@ -189,6 +225,7 @@ run_bench() {
         --skip-warmup \
         --show-report \
         --profile \
+        --profile-by-stage \
         --profile-output-dir "$PROFILE_OUTPUT" \
         "$@" 2>&1 | tee "$SERVER_LOG"
     local RC=${PIPESTATUS[0]}
@@ -225,13 +262,17 @@ run_bench "LoRA (${LORA_BACKEND}, virtual experts)" "lora" \
     --moe-runner-backend triton \
     --experts-shared-outer-loras \
     --lora-use-virtual-experts \
+    --disable-piecewise-cuda-graph \
     --prefill-attention-backend fa4 \
     --decode-attention-backend fa4 \
     --lora-name my_lora
 process_profiles "lora"
 
 if [[ "$SKIP_NOLORA" != "1" ]]; then
-    run_bench "Pure base model (no LoRA)" "nolora" \
+    run_bench "Pure base model (no LoRA, triton MoE for apples-to-apples)" "nolora" \
+        --mem-fraction-static 0.82 \
+        --moe-runner-backend triton \
+        --disable-piecewise-cuda-graph \
         --prefill-attention-backend fa4 \
         --decode-attention-backend fa4
     process_profiles "nolora"
