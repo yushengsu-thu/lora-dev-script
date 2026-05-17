@@ -35,7 +35,13 @@ TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/perf_results_comp/${TIMESTAMP}}"
 LORA_BACKEND="${LORA_BACKEND:-csgmv}"
 SKIP_SERVER_WARMUP="${SKIP_SERVER_WARMUP:-0}"
+SKIP_LORA="${SKIP_LORA:-0}"
 SKIP_NOLORA="${SKIP_NOLORA:-0}"
+# PROFILE_BY_STAGE=1 → split EXTEND/DECODE into separate trace files (sglang's
+# --profile-by-stage). Default (0) keeps prefill+decode in a single profile so
+# the whole forward pass is visible on one timeline, which is what we usually
+# want for LoRA-vs-noLoRA comparisons.
+PROFILE_BY_STAGE="${PROFILE_BY_STAGE:-0}"
 mkdir -p "$RESULT_DIR"
 rm -f "${RESULT_DIR}"/*.jsonl
 
@@ -55,6 +61,9 @@ pip install -q orjson typer 2>/dev/null || true
 SERVER_WARMUP_ARG=()
 [[ "$SKIP_SERVER_WARMUP" == "1" ]] && SERVER_WARMUP_ARG=(--skip-server-warmup)
 
+PROFILE_BY_STAGE_ARG=()
+[[ "$PROFILE_BY_STAGE" == "1" ]] && PROFILE_BY_STAGE_ARG=(--profile-by-stage)
+
 MAX_BS=0
 for bs in "${BATCH_SIZES[@]}"; do (( bs > MAX_BS )) && MAX_BS=$bs; done
 
@@ -64,6 +73,7 @@ echo "  Model: ${MODEL_PATH} | TP=${TP}"
 echo "  BSs: ${BATCH_SIZES[*]}  (first ${NUM_WARMUP} = warmup, max-running-requests=${MAX_BS})"
 echo "  input_len=${INPUT_LEN}  output_len=${OUTPUT_LEN}"
 echo "  LoRA backend: ${LORA_BACKEND}  skip_server_warmup=${SKIP_SERVER_WARMUP}"
+echo "  profile_by_stage=${PROFILE_BY_STAGE}  skip_lora=${SKIP_LORA}  skip_nolora=${SKIP_NOLORA}"
 echo "================================================================"
 
 cleanup() {
@@ -225,7 +235,7 @@ run_bench() {
         --skip-warmup \
         --show-report \
         --profile \
-        --profile-by-stage \
+        "${PROFILE_BY_STAGE_ARG[@]}" \
         --profile-output-dir "$PROFILE_OUTPUT" \
         "$@" 2>&1 | tee "$SERVER_LOG"
     local RC=${PIPESTATUS[0]}
@@ -253,20 +263,26 @@ run_bench() {
     return 0
 }
 
-run_bench "LoRA (${LORA_BACKEND}, virtual experts)" "lora" \
-    --mem-fraction-static 0.82 \
-    --enable-lora \
-    --lora-paths my_lora="$ADAPTER_PATH" \
-    --max-lora-rank 32 \
-    --lora-backend "$LORA_BACKEND" \
-    --moe-runner-backend triton \
-    --experts-shared-outer-loras \
-    --lora-use-virtual-experts \
-    --disable-piecewise-cuda-graph \
-    --prefill-attention-backend fa4 \
-    --decode-attention-backend fa4 \
-    --lora-name my_lora
-process_profiles "lora"
+if [[ "$SKIP_LORA" != "1" ]]; then
+    run_bench "LoRA (${LORA_BACKEND}, virtual experts)" "lora" \
+        --mem-fraction-static 0.82 \
+        --enable-lora \
+        --lora-paths my_lora="$ADAPTER_PATH" \
+        --max-lora-rank 32 \
+        --lora-backend "$LORA_BACKEND" \
+        --moe-runner-backend triton \
+        --experts-shared-outer-loras \
+        --lora-use-virtual-experts \
+        --disable-piecewise-cuda-graph \
+        --prefill-attention-backend fa4 \
+        --decode-attention-backend fa4 \
+        --lora-name my_lora
+    # NOTE: subshell + "|| true" is required. process_profiles uses `set -u`-
+    # sensitive constructs (BASH_REMATCH[1], associative arrays) which, if they
+    # hit an unbound-variable, would kill the parent shell despite there being
+    # no `set -e` — and we MUST reach the no-LoRA scenario below regardless.
+    ( process_profiles "lora" ) || echo "  (process_profiles lora failed; continuing to no-LoRA scenario)"
+fi
 
 if [[ "$SKIP_NOLORA" != "1" ]]; then
     run_bench "Pure base model (no LoRA, triton MoE for apples-to-apples)" "nolora" \
@@ -275,7 +291,7 @@ if [[ "$SKIP_NOLORA" != "1" ]]; then
         --disable-piecewise-cuda-graph \
         --prefill-attention-backend fa4 \
         --decode-attention-backend fa4
-    process_profiles "nolora"
+    ( process_profiles "nolora" ) || echo "  (process_profiles nolora failed; raw traces still in profile_nolora/)"
 fi
 
 echo ""
