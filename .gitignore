@@ -5,6 +5,8 @@
 !*.py
 !*.sh
 !lora_perf/
+!perf_results_comp/
+!perf_results_comp/**
 
 # Keep .gitignore itself
 !.gitignore
