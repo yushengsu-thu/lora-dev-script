@@ -12,8 +12,8 @@ TP=4
 
 PROFILE_BASE="${SCRIPT_DIR}/lora_profiling_0425_seq_8192_no_radix"
 
-SERVE_INPUT_LEN=65536
-SERVE_OUTPUT_LEN=32
+SERVE_INPUT_LEN=8192
+SERVE_OUTPUT_LEN=1024
 SERVE_NUM_PROMPTS=10
 SERVE_MAX_CONCURRENCY=4
 
@@ -282,12 +282,26 @@ done
 
 cleanup
 
+# --- Copy results to perf_results_comp ---
+RESULT_ROOT="/home/radixark/yushengsu/perf_results_comp"
+TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+RESULT_DIR="${RESULT_ROOT}/${TIMESTAMP}"
+
+log "═══ Copying results to ${RESULT_DIR} ═══"
+mkdir -p "${RESULT_DIR}/no_lora"
+mkdir -p "${RESULT_DIR}/lora"
+
+cp -r "${PROFILE_BASE}/no_lora_cg_no_radix/." "${RESULT_DIR}/no_lora/"
+cp -r "${PROFILE_BASE}/lora_cg_no_radix/."    "${RESULT_DIR}/lora/"
+
+log "Results copied successfully."
+
 echo ""
 echo "================================================================"
 echo "  Profiling Complete!"
-echo "  Results: ${PROFILE_BASE}/"
-echo "    no_lora_cg_no_radix/ — Base model + CG + Radix Cache disabled (2nd run)"
-echo "    lora_cg_no_radix/    — LoRA model + CG + Radix Cache disabled (2nd run)"
+echo "  Results: ${RESULT_DIR}/"
+echo "    no_lora/ — Base model + CG + Radix Cache disabled (2nd run)"
+echo "    lora/    — LoRA model + CG + Radix Cache disabled (2nd run)"
 echo ""
 echo "  Each directory contains:"
 echo "    - Original TP trace files"
