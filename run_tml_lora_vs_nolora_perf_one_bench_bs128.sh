@@ -125,17 +125,13 @@ if [[ "$SKIP_LORA" != "1" ]]; then
         --moe-runner-backend triton \
         --experts-shared-outer-loras \
         --lora-use-virtual-experts \
-        --prefill-attention-backend fa4 \
-        --decode-attention-backend fa4 \
         --lora-name my_lora
 fi
 
 if [[ "$SKIP_NOLORA" != "1" ]]; then
     run_bench "Pure base model (no LoRA, triton MoE for apples-to-apples)" "nolora" \
         --mem-fraction-static 0.82 \
-        --moe-runner-backend triton \
-        --prefill-attention-backend fa4 \
-        --decode-attention-backend fa4
+        --moe-runner-backend triton
 fi
 
 echo ""

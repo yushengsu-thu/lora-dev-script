@@ -190,9 +190,7 @@ run_lora_cg_no_radix() {
         --lora-backend csgmv \
         --moe-runner-backend triton \
         --experts-shared-outer-loras \
-        --lora-use-virtual-experts \
-        --prefill-attention-backend fa4 \
-        --decode-attention-backend fa4 \
+        --lora-use-virtual-experts
         &
     local SERVER_PID=$!
     wait_for_server
