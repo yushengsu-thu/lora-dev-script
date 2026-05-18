@@ -26,15 +26,16 @@ ADAPTER_PATH="${SCRIPT_DIR}/lora_test_cases/Qwen3-30B-A3B-Instruct-2507"
 PORT=30000
 TP=4
 # INPUT_LEN / OUTPUT_LEN are overridable from the env so we can sweep prompt
-# shapes without editing the script. Defaults (2048 / 128) keep the script's
+# shapes without editing the script. Defaults (8192 / 1024) keep the script's
 # original BS=128-fits-on-4×GB300 behavior. Bigger shapes (e.g. 8192 / 1024)
 # work but you'll typically also want PROFILE_STEPS≫30 to cover prefill +
 # decode at the new shape — chunked prefill needs ~ceil(BS × input_len /
 # chunked_prefill_size) forward passes just to finish prefill.
-INPUT_LEN="${INPUT_LEN:-2048}"
-OUTPUT_LEN="${OUTPUT_LEN:-128}"
+INPUT_LEN="${INPUT_LEN:-8192}"
+OUTPUT_LEN="${OUTPUT_LEN:-1024}"
 # (1) is warmup; (128) is the production trial we actually want to read.
-BATCH_SIZES=(1 128)
+# BATCH_SIZES=(1 128)
+BATCH_SIZES=(1 64)
 NUM_WARMUP=1
 
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
